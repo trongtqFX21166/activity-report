@@ -134,7 +134,7 @@ def process_activity_points(month, year, env):
             return False
 
         # Read activity transactions from Delta table
-        transactions_df = spark.read.format("delta").table("activity_dev.activity_transaction")
+        transactions_df = spark.read.format("delta").table("activity.activity_transaction")
 
         # Filter relevant data - only AddPoint transactions for the specified month and year
         filtered_df = transactions_df.filter(
