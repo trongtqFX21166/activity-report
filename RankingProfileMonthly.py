@@ -6,18 +6,80 @@ from pymongo import MongoClient, UpdateOne
 import pytz
 import argparse
 import sys
+import os
 
 
-def create_spark_session():
+def get_environment():
+    """
+    Determine the execution environment (dev or prod).
+    Can be specified as a command-line argument or environment variable.
+    Defaults to 'dev' if not specified.
+    """
+    # Check command line arguments
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
+        return sys.argv[1].lower()
+
+    # Check environment variables
+    env = os.environ.get('ENVIRONMENT', 'dev').lower()
+    if env in ['dev', 'prod']:
+        return env
+
+    # Default to dev
+    return 'dev'
+
+
+def get_mongodb_config(env):
+    """Return MongoDB configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            'host': 'mongodb://192.168.10.97:27017',
+            'database': 'activity_membershiptransactionmonthly_dev'
+        }
+    else:  # prod
+        return {
+            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
+            'database': 'activity_membershiptransactionmonthly',
+            'auth_source': 'admin'
+        }
+
+
+def create_spark_session(env):
     """Create Spark session with MongoDB configurations"""
-    return SparkSession.builder \
-        .appName("membershiptransactionmonthly_ranking") \
-        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
-        .config("spark.mongodb.read.connection.uri", "mongodb://192.168.10.97:27017") \
-        .config("spark.mongodb.write.connection.uri", "mongodb://192.168.10.97:27017") \
-        .config("spark.mongodb.read.database", "activity_membershiptransactionmonthly_dev") \
-        .config("spark.mongodb.write.database", "activity_membershiptransactionmonthly_dev") \
-        .getOrCreate()
+    mongo_config = get_mongodb_config(env)
+
+    builder = SparkSession.builder \
+        .appName(f"membershiptransactionmonthly_ranking_{env}") \
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
+
+    # Add MongoDB configuration
+    builder = builder \
+        .config("spark.mongodb.read.connection.uri", mongo_config['host']) \
+        .config("spark.mongodb.write.connection.uri", mongo_config['host']) \
+        .config("spark.mongodb.read.database", mongo_config['database']) \
+        .config("spark.mongodb.write.database", mongo_config['database'])
+
+    if 'auth_source' in mongo_config:
+        builder = builder \
+            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
+
+    return builder.getOrCreate()
+
+
+def get_mongodb_connection(env):
+    """Create MongoDB client connection"""
+    mongo_config = get_mongodb_config(env)
+    try:
+        if env == 'dev':
+            client = MongoClient(mongo_config['host'])
+        else:  # prod
+            client = MongoClient(
+                mongo_config['host'],
+                authSource=mongo_config['auth_source']
+            )
+        return client
+    except Exception as e:
+        print(f"Error connecting to MongoDB: {str(e)}")
+        raise
 
 
 def get_current_month_year():
@@ -25,16 +87,6 @@ def get_current_month_year():
     vietnam_tz = pytz.timezone('Asia/Ho_Chi_Minh')
     now = datetime.now(vietnam_tz)
     return now.month, now.year
-
-
-def get_mongodb_connection():
-    """Create MongoDB client connection"""
-    try:
-        client = MongoClient('mongodb://192.168.10.97:27017/')
-        return client
-    except Exception as e:
-        print(f"Error connecting to MongoDB: {str(e)}")
-        raise
 
 
 def validate_month_year(month, year):
@@ -54,7 +106,7 @@ def validate_month_year(month, year):
         return False
 
 
-def calculate_unique_ranks(month=None, year=None):
+def calculate_unique_ranks(month=None, year=None, env='dev'):
     """Calculate and update unique ranks for the specified month or current month"""
     spark = None
     mongo_client = None
@@ -68,12 +120,13 @@ def calculate_unique_ranks(month=None, year=None):
         if not validate_month_year(month, year):
             raise ValueError(f"Invalid month/year combination: {month}/{year}")
 
-        print(f"Processing rankings for month: {month}, year: {year}")
+        print(f"Processing rankings for month: {month}, year: {year} in {env.upper()} environment")
 
         # Initialize connections
-        spark = create_spark_session()
-        mongo_client = get_mongodb_connection()
-        db = mongo_client['activity_membershiptransactionmonthly_dev']
+        spark = create_spark_session(env)
+        mongo_client = get_mongodb_connection(env)
+        mongo_config = get_mongodb_config(env)
+        db = mongo_client[mongo_config['database']]
 
         # Determine collection name
         collection_name = f"{year}_{month}"
@@ -162,21 +215,6 @@ def calculate_unique_ranks(month=None, year=None):
         else:
             print("Success: All ranks are unique!")
 
-        # Show examples of tied points
-        # print("\nExamples of Users with Same Points but Different Ranks:")
-        # window_points = Window.partitionBy("totalpoints")
-        # tied_points_df = ranked_df \
-        #     .withColumn("users_with_same_points", count("*").over(window_points)) \
-        #     .where(col("users_with_same_points") > 1) \
-        #     .orderBy("totalpoints", "new_rank") \
-        #     .select(
-        #     "totalpoints",
-        #     "new_rank",
-        #     "phone",
-        #     "timestamp"
-        # )
-        # tied_points_df.show(10)
-
         # Show points distribution
         print("\nPoints Distribution Summary:")
         ranked_df.summary("count", "min", "max", "mean").select(
@@ -199,9 +237,10 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Process membership transaction monthly rankings')
     parser.add_argument('--month', type=int, help='Month to process (1-12)')
     parser.add_argument('--year', type=int, help='Year to process')
+    parser.add_argument('--env', type=str, choices=['dev', 'prod'], help='Environment (dev or prod)')
 
     # Handle arguments for both direct running and spark-submit
-    if '--month' in sys.argv or '--year' in sys.argv:
+    if '--month' in sys.argv or '--year' in sys.argv or '--env' in sys.argv:
         args = parser.parse_args()
     else:
         # Handle case when script is run with spark-submit where args come after script
@@ -215,8 +254,17 @@ def main():
     """Main entry point of the script"""
     print(f"Starting MembershipTransactionMonthly Ranking Process at {datetime.now()}")
 
+    # Determine environment
+    env = get_environment()
+    print(f"Running in {env.upper()} environment")
+
     # Parse command line arguments
     args = parse_arguments()
+
+    # Override environment if specified in args
+    if args.env:
+        env = args.env
+        print(f"Environment overridden to: {env.upper()}")
 
     # Get month and year from arguments or use current
     month = args.month
@@ -230,8 +278,8 @@ def main():
         year = year or curr_year
         print(f"Using month: {month}/{year} (current: {curr_month}/{curr_year})")
 
-    # Run the ranking calculation
-    calculate_unique_ranks(month, year)
+    # Run the ranking calculation with environment
+    calculate_unique_ranks(month, year, env)
 
     print(f"MembershipTransactionMonthly Ranking Process Completed at {datetime.now()}")
 

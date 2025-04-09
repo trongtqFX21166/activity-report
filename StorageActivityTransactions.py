@@ -177,6 +177,7 @@ def main():
         StructField("Year", IntegerType()),
         StructField("EventCode", StringType()),
         StructField("ReportCode", StringType()),
+        StructField("ActivityId", StringType()),
         StructField("CampaignId", StringType()),
         StructField("RuleId", StringType()),
         StructField("CampaignName", StringType()),
@@ -240,7 +241,7 @@ def main():
         .outputMode("append") \
         .foreachBatch(process_batch_with_env) \
         .option("checkpointLocation", checkpoint_path) \
-        .trigger(processingTime='30 seconds') \
+        .trigger(processingTime='10 seconds') \
         .start()
 
     streaming_query.awaitTermination()

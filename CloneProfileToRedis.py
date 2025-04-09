@@ -39,9 +39,9 @@ POSTGRES_CONFIG = {
 }
 
 REDIS_CONFIG = {
-    'host': '192.168.8.226',
+    'host': '192.168.11.84',
     'port': 6379,
-    'password': '0ef1sJm19w3OKHiH',
+    'password': 'oPn7NjDi569uCriqYbm9iCvR',
     'decode_responses': True
 }
 
