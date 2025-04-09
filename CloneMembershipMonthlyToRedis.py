@@ -1,5 +1,6 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
+# Import specific functions instead of using wildcard to avoid shadowing built-ins
+from pyspark.sql.functions import col, desc, asc, lit, current_timestamp
 from redis import Redis
 import json
 import sys
@@ -58,11 +59,54 @@ def get_mongodb_config(env):
             'database': 'activity_membershiptransactionmonthly_dev'
         }
     else:  # prod
+        # Use the full connection string with authentication details
+        # Use admin database for authentication source (default)
         return {
-            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
+            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017/?authSource=admin',
             'database': 'activity_membershiptransactionmonthly',
             'auth_source': 'admin'
         }
+
+
+def get_mongodb_client(env):
+    """Create and return MongoDB client based on environment"""
+    mongo_config = get_mongodb_config(env)
+    try:
+        # Import here to ensure availability
+        from pymongo import MongoClient
+
+        # Create MongoDB client with appropriate settings
+        if env == 'dev':
+            # Development environment - no auth
+            client = MongoClient(mongo_config['host'])
+        else:  # prod
+            # Production environment - parse connection string which includes auth credentials
+            # The connection string format: mongodb://username:password@host1,host2,host3/database?authSource=admin
+            client = MongoClient(
+                mongo_config['host'],
+                authSource=mongo_config.get('auth_source', 'admin')
+            )
+
+        # Test connection with proper error handling
+        try:
+            # Ping the database to verify connection works
+            client.admin.command('ping')
+            logger.info(f"Successfully connected to MongoDB ({env} environment)")
+        except Exception as ping_error:
+            logger.error(f"Failed to ping MongoDB: {str(ping_error)}")
+            # Try a different approach to test connection
+            try:
+                # Just list databases to check connectivity
+                client.list_database_names()
+                logger.info(f"Successfully listed databases from MongoDB ({env} environment)")
+            except Exception as list_error:
+                logger.error(f"Failed to list databases: {str(list_error)}")
+                raise
+
+        return client
+    except Exception as e:
+        logger.error(f"Error connecting to MongoDB: {str(e)}")
+        raise
 
 
 def get_redis_config(env):
@@ -91,20 +135,22 @@ def create_spark_session(env):
     """Create Spark session with MongoDB configurations"""
     mongo_config = get_mongodb_config(env)
 
+    # Extract the host without the mongodb:// prefix for clarity in logs
+    host_for_logging = mongo_config['host'].replace('mongodb://', '').split('/?')[0]
+    logger.info(f"Configuring Spark to connect to MongoDB at {host_for_logging}")
+
+    # Build the SparkSession with the MongoDB connector package
     builder = SparkSession.builder \
         .appName(f"membership-monthly-redis-sync-{env}") \
-        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
-        .config("spark.mongodb.read.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.write.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.read.database", mongo_config['database']) \
-        .config("spark.mongodb.write.database", mongo_config['database'])
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
 
-    # Add authentication for production
-    if env == 'prod' and 'auth_source' in mongo_config:
-        builder = builder \
-            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
+    # Create and return the SparkSession
+    spark = builder.getOrCreate()
 
-    return builder.getOrCreate()
+    # Log the created session
+    logger.info(f"Created Spark session with app ID: {spark.sparkContext.applicationId}")
+
+    return spark
 
 
 def setup_redis_connection(env):
@@ -239,16 +285,25 @@ def process_batch(batch_df, redis_client, env):
         raise
 
 
-def read_from_mongodb(spark, month, year):
+def read_from_mongodb(spark, month, year, env):
     """Read data from MongoDB with specified month/year filter"""
     collection_name = f"{year}_{month}"
-    logger.info(f"Reading data from MongoDB collection: {collection_name}")
+    mongo_config = get_mongodb_config(env)
+    database = mongo_config['database']
+    connection_string = mongo_config['host']
 
-    return spark.read \
+    logger.info(f"Reading from MongoDB: {database}.{collection_name}")
+    logger.info(f"Using connection string: {connection_string}")
+
+    # For MongoDB connector v4+, we need to use the full connection string with explicit database
+    df = spark.read \
         .format("mongodb") \
+        .option("connection.uri", connection_string) \
+        .option("database", database) \
         .option("collection", collection_name) \
-        .option("readConcern.level", "majority") \
         .load()
+
+    return df
 
 
 def process_data(spark, redis_client, month=None, year=None, env='dev'):
@@ -262,8 +317,8 @@ def process_data(spark, redis_client, month=None, year=None, env='dev'):
 
         logger.info(f"Starting data processing for {month}/{year} in {env} environment...")
 
-        # Read from MongoDB with specified month/year filter
-        df = read_from_mongodb(spark, month, year)
+        # Read from MongoDB with specified month/year filter - passing the env parameter
+        df = read_from_mongodb(spark, month, year, env)
         total_records = df.count()
         logger.info(f"Found {total_records} records to process")
 
@@ -275,7 +330,16 @@ def process_data(spark, redis_client, month=None, year=None, env='dev'):
         batch_size = 200  # Smaller batch size for better control
 
         # Repartition the dataframe for more efficient processing
-        num_partitions = max(1, (total_records + batch_size - 1) // batch_size)
+        # Safely calculate number of partitions using built-in max directly
+        num_partitions = 1
+        if total_records > 0:
+            num_partitions = max(1, (total_records + batch_size - 1) // batch_size)
+
+        # If we're on a 'prod' environment, limit the max partitions to prevent overloading
+        if env == 'prod':
+            num_partitions = min(num_partitions, 20)  # Cap at 20 partitions for production
+
+        logger.info(f"Using {num_partitions} partitions for processing {total_records} records")
         df_partitioned = df.repartition(num_partitions)
 
         total_inserts = 0
@@ -331,6 +395,19 @@ def main():
 
         spark = None
         redis_client = None
+        mongo_client = None
+
+        # Verify MongoDB connection first to fail fast if there's an auth problem
+        try:
+            logger.info(f"Testing MongoDB connection for {env} environment...")
+            mongo_client = get_mongodb_client(env)
+            # Test successful, close the connection for now
+            mongo_client.close()
+            mongo_client = None
+            logger.info("MongoDB connection test successful")
+        except Exception as mongo_error:
+            logger.error(f"MongoDB connection test failed: {str(mongo_error)}")
+            raise
 
         # Initialize Spark
         spark = create_spark_session(env)
@@ -351,6 +428,8 @@ def main():
         sys.exit(1)
 
     finally:
+        if mongo_client:
+            mongo_client.close()
         if spark:
             spark.stop()
         if redis_client:
