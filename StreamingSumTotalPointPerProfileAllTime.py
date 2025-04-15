@@ -5,31 +5,83 @@ import os
 import psycopg2
 from psycopg2.extras import execute_batch
 from datetime import datetime
+import sys
 
 os.environ[
     'PYSPARK_SUBMIT_ARGS'] = '--packages io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-streaming_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.postgresql:postgresql:42.6.0 pyspark-shell'
 
 
-def create_spark_session(app_name):
-    """Create and configure Spark session"""
-    return SparkSession.builder \
-        .appName(app_name) \
+def get_environment():
+    """
+    Determine the execution environment (dev or prod).
+    Can be specified as a command-line argument or environment variable.
+    Defaults to 'dev' if not specified.
+    """
+    # Check command line arguments
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
+        return sys.argv[1].lower()
+
+    # Check environment variables
+    env = os.environ.get('ENVIRONMENT', 'dev').lower()
+    if env in ['dev', 'prod']:
+        return env
+
+    # Default to dev
+    return 'dev'
+
+
+def get_postgres_config(env):
+    """Return PostgreSQL configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            "host": "192.168.8.230",
+            "database": "TrongTestDB1",
+            "user": "postgres",
+            "password": "admin123."
+        }
+    else:  # prod
+        return {
+            "host": "192.168.11.83",
+            "database": "ActivityDB",
+            "user": "vmladmin",
+            "password": "5d6v6hiFGGns4onnZGW0VfKe"
+        }
+
+
+def get_kafka_config(env):
+    """Return Kafka configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            'bootstrap.servers': '192.168.8.184:9092',
+            'sasl.jaas.config': 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="Vietmap2021!@#";',
+            'security.protocol': 'SASL_PLAINTEXT',
+            'sasl.mechanism': 'PLAIN'
+        }
+    else:  # prod
+        return {
+            'bootstrap.servers': '192.168.11.201:9092,192.168.11.202:9092,192.168.11.203:9092',
+            'sasl.jaas.config': 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="3z740GCxK5xWfqoqKwxj";',
+            'security.protocol': 'SASL_PLAINTEXT',
+            'sasl.mechanism': 'PLAIN'
+        }
+
+
+def create_spark_session(app_name, env):
+    """Create and configure Spark session with environment-specific settings"""
+    builder = SparkSession.builder \
+        .appName(f"{app_name}-{env}") \
         .config("hive.metastore.uris", "thrift://192.168.10.167:9083") \
         .config("spark.sql.warehouse.dir", "/users/hive/warehouse") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .enableHiveSupport() \
-        .getOrCreate()
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+
+    return builder.enableHiveSupport().getOrCreate()
 
 
-def get_postgres_connection():
-    """Create a connection to the PostgreSQL database"""
-    return psycopg2.connect(
-        host="192.168.8.230",  # This is the host from ActivityEventSummaryReport.py
-        database="TrongTestDB1",  # Using the same database as in the sample code
-        user="postgres",
-        password="admin123."
-    )
+def get_postgres_connection(env):
+    """Create a connection to the PostgreSQL database based on environment"""
+    config = get_postgres_config(env)
+    return psycopg2.connect(**config)
 
 
 def update_profiles_batch(conn, updates):
@@ -61,8 +113,8 @@ def update_profiles_batch(conn, updates):
     conn.commit()
 
 
-def process_point_updates(batch_df, batch_id):
-    """Process each batch and update profile points in PostgreSQL"""
+def process_point_updates(batch_df, batch_id, env):
+    """Process each batch and update profile points in PostgreSQL with environment context"""
     if batch_df.isEmpty():
         return
 
@@ -87,31 +139,32 @@ def process_point_updates(batch_df, batch_id):
             return
 
         # Store updates in PostgreSQL
-        conn = get_postgres_connection()
+        conn = get_postgres_connection(env)
         try:
             update_profiles_batch(conn, updates)
-            print(f"Successfully updated {len(updates)} profiles in PostgreSQL")
+            print(f"[{env.upper()}] Successfully updated {len(updates)} profiles in PostgreSQL")
         finally:
             conn.close()
 
         # Show sample results
-        print("\nSample Updates:")
+        print(f"\n[{env.upper()}] Sample Updates:")
         profile_updates.show(5, truncate=False)
 
     except Exception as e:
-        print(f"Error processing batch {batch_id}: {str(e)}")
+        print(f"Error processing batch {batch_id} in {env} environment: {str(e)}")
         raise
 
 
 def main():
-    print("Starting Profile Points Update Streaming Process")
+    # Determine environment
+    env = get_environment()
+    print(f"Starting Profile Points Update Streaming Process in {env.upper()} environment")
 
-    env = "dev"
-    kafka_host_prod = "192.168.10.221:9093,192.168.10.222:9093,192.168.10.223:9093,192.168.10.171:9093"
-    kafka_host_dev = "192.168.8.184:9092"
+    # Get Kafka configuration for the specified environment
+    kafka_config = get_kafka_config(env)
 
     # Initialize Spark Session
-    spark = create_spark_session("profile points updater")
+    spark = create_spark_session("profile points updater", env)
 
     # Define schema based on VML_ActivityTransaction message
     schema = ArrayType(StructType([
@@ -137,13 +190,13 @@ def main():
 
     # Configure Kafka connection
     kafka_options = {
-        "kafka.bootstrap.servers": kafka_host_prod if env == "prod" else kafka_host_dev,
-        "kafka.sasl.jaas.config": 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="Vietmap2021!@#";',
-        "kafka.security.protocol": "SASL_PLAINTEXT",
-        "kafka.sasl.mechanism": "PLAIN",
+        "kafka.bootstrap.servers": kafka_config["bootstrap.servers"],
+        "kafka.sasl.jaas.config": kafka_config["sasl.jaas.config"],
+        "kafka.security.protocol": kafka_config["security.protocol"],
+        "kafka.sasl.mechanism": kafka_config["sasl.mechanism"],
         "subscribe": "VML_ActivityTransaction",
         "startingOffsets": "earliest",
-        "kafka.group.id": "profile-points-updater",
+        "kafka.group.id": f"profile-points-updater-{env}",
         "failOnDataLoss": "false",
         "maxOffsetsPerTrigger": "1000"
     }
@@ -172,11 +225,18 @@ def main():
     for column in trans_stream_df.columns:
         trans_stream_df = trans_stream_df.withColumnRenamed(column, column.lower())
 
+    # Customize process_batch function to include environment
+    def process_batch_with_env(batch_df, batch_id):
+        return process_point_updates(batch_df, batch_id, env)
+
+    # Environment-specific checkpoint location
+    checkpoint_location = f"/activity_{env}/chk-point-dir/profile-points-updater"
+
     # Start streaming process
     streaming_query = trans_stream_df.writeStream \
         .outputMode("append") \
-        .foreachBatch(process_point_updates) \
-        .option("checkpointLocation", "/activity_dev/chk-point-dir/profile-points-updater") \
+        .foreachBatch(process_batch_with_env) \
+        .option("checkpointLocation", checkpoint_location) \
         .trigger(processingTime='30 seconds') \
         .start()
 

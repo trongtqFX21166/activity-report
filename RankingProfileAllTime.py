@@ -1,13 +1,12 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.window import Window
-from pyspark.sql.types import *
-import time
 from datetime import datetime
 import psycopg2
-from psycopg2.extras import execute_batch, RealDictCursor
+from psycopg2.extras import execute_batch
 import logging
 import os
+import sys
 
 # Configure logging
 logging.basicConfig(
@@ -16,73 +15,97 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ProfileRankUpdater")
 
-# Configuration
-POSTGRES_CONFIG = {
-    "host": "192.168.8.230",
-    "database": "TrongTestDB1",
-    "user": "postgres",
-    "password": "admin123."
-}
+
+def get_environment():
+    """
+    Determine the execution environment (dev or prod).
+    Can be specified as a command-line argument or environment variable.
+    Defaults to 'dev' if not specified.
+    """
+    # Check command line arguments
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
+        return sys.argv[1].lower()
+
+    # Check environment variables
+    env = os.environ.get('ENVIRONMENT', 'dev').lower()
+    if env in ['dev', 'prod']:
+        return env
+
+    # Default to dev
+    return 'dev'
 
 
-def create_spark_session():
-    """Create a Spark session"""
+def get_postgres_config(env):
+    """Return PostgreSQL configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            "host": "192.168.8.230",
+            "database": "TrongTestDB1",
+            "user": "postgres",
+            "password": "admin123."
+        }
+    else:  # prod
+        return {
+            "host": "192.168.11.83",
+            "database": "ActivityDB",
+            "user": "vmladmin",
+            "password": "5d6v6hiFGGns4onnZGW0VfKe"
+        }
+
+
+def create_spark_session(env):
+    """Create Spark session with environment-specific configurations"""
     return SparkSession.builder \
-        .appName("ProfileRankUpdater") \
+        .appName(f"ProfileRankUpdater-AllTime-{env}") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
 
 
-def fetch_profiles_from_postgres():
+def get_postgres_connection(env):
+    """Create a connection to PostgreSQL database using environment-specific config"""
+    try:
+        config = get_postgres_config(env)
+        conn = psycopg2.connect(**config)
+        return conn
+    except Exception as e:
+        logger.error(f"Error connecting to PostgreSQL: {str(e)}")
+        raise
+
+
+def fetch_profiles_from_postgres(env):
     """Fetch profiles directly from PostgreSQL"""
-    logger.info("Fetching profiles from PostgreSQL")
+    logger.info(f"Fetching profiles from PostgreSQL ({env} environment)")
 
     conn = None
     try:
-        conn = psycopg2.connect(**POSTGRES_CONFIG)
-        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+        conn = get_postgres_connection(env)
+        with conn.cursor() as cursor:
             cursor.execute(
-                'SELECT "Id", "Phone", "TotalPoints", "Rank", "MembershipCode" FROM public."Profiles"'
+                'SELECT "Id", "Phone", "TotalPoints", "Rank" FROM public."Profiles"'
             )
             profiles = cursor.fetchall()
 
         logger.info(f"Fetched {len(profiles)} profiles from database")
 
-        # Safely compute statistics
+        # Show statistics for points
         try:
             if profiles:
-                # Use a safer approach to extract points
-                total_points = []
-                for p in profiles:
-                    try:
-                        if p["TotalPoints"] is not None:
-                            total_points.append(int(p["TotalPoints"]))
-                    except (TypeError, ValueError) as e:
-                        logger.warning(f"Could not convert TotalPoints for profile {p['Id']}: {e}")
-
-                if total_points:  # Only compute stats if we have valid points
-                    min_points = min(total_points)
-                    max_points = max(total_points)
-                    avg_points = sum(total_points) / len(total_points)
-
+                points_list = [p[2] for p in profiles if p[2] is not None]
+                if points_list:
+                    min_points = min(points_list)
+                    max_points = max(points_list)
+                    avg_points = sum(points_list) / len(points_list)
                     logger.info(f"Points statistics - Min: {min_points}, Max: {max_points}, Avg: {avg_points:.2f}")
 
                     # Show top profiles by points
-                    # Sort profiles based on TotalPoints, handling None values
-                    def get_points(profile):
-                        try:
-                            return int(profile["TotalPoints"]) if profile["TotalPoints"] is not None else -1
-                        except (TypeError, ValueError):
-                            return -1
-
-                    top_profiles = sorted(profiles, key=get_points, reverse=True)[:5]
+                    sorted_profiles = sorted(profiles, key=lambda p: p[2] if p[2] is not None else 0, reverse=True)
+                    top_profiles = sorted_profiles[:5]
                     logger.info("Top 5 profiles by points:")
                     for p in top_profiles:
-                        logger.info(f"Phone: {p['Phone']}, Points: {p['TotalPoints']}, Current Rank: {p['Rank']}")
+                        logger.info(f"Phone: {p[1]}, Points: {p[2]}, Current Rank: {p[3]}")
         except Exception as stats_error:
             logger.warning(f"Error calculating statistics: {stats_error}")
-            # Continue processing even if statistics calculation fails
 
         return profiles
     except Exception as e:
@@ -93,216 +116,180 @@ def fetch_profiles_from_postgres():
             conn.close()
 
 
-def create_spark_dataframe_from_profiles(spark, profiles):
-    """Convert Python list of profiles to Spark DataFrame, handling potential data issues"""
-    logger.info("Converting profiles to Spark DataFrame")
+def calculate_unique_ranks(profiles, env):
+    """Calculate and update unique ranks for all profiles"""
+    spark = None
+    conn = None
 
-    # Define schema for the DataFrame
-    schema = StructType([
-        StructField("Id", StringType(), False),
-        StructField("Phone", StringType(), False),
-        StructField("TotalPoints", IntegerType(), True),  # Allow null values
-        StructField("Rank", IntegerType(), True),  # Allow null values
-        StructField("MembershipCode", StringType(), True),
-    ])
+    try:
+        # Initialize Spark
+        spark = create_spark_session(env)
 
-    # Convert list of dict to list of tuples, with defensive programming
-    profile_data = []
-    for p in profiles:
-        try:
-            # Handle potential missing or invalid data
-            profile_id = str(p["Id"]) if p["Id"] is not None else ""
-            phone = str(p["Phone"]) if p["Phone"] is not None else ""
+        # Convert profiles list to DataFrame
+        from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
-            # Convert TotalPoints and Rank to int, defaulting to 0 if invalid
-            try:
-                total_points = int(p["TotalPoints"]) if p["TotalPoints"] is not None else 0
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid TotalPoints for profile {profile_id}: {p['TotalPoints']}")
-                total_points = 0
+        schema = StructType([
+            StructField("id", StringType(), False),
+            StructField("phone", StringType(), False),
+            StructField("totalPoints", IntegerType(), True),
+            StructField("rank", IntegerType(), True)
+        ])
 
-            try:
-                rank = int(p["Rank"]) if p["Rank"] is not None else 9999999
-            except (ValueError, TypeError):
-                logger.warning(f"Invalid Rank for profile {profile_id}: {p['Rank']}")
-                rank = 9999999
+        # Handle potential None values for totalPoints
+        profile_data = []
+        for p in profiles:
+            profile_data.append(
+                (
+                    str(p[0]),  # id
+                    str(p[1]),  # phone
+                    int(p[2]) if p[2] is not None else 0,  # totalPoints
+                    int(p[3]) if p[3] is not None else 9999999  # rank
+                )
+            )
 
-            membership_code = str(p["MembershipCode"]) if p["MembershipCode"] is not None else ""
+        df = spark.createDataFrame(profile_data, schema)
 
-            profile_data.append((profile_id, phone, total_points, rank, membership_code))
-        except Exception as e:
-            logger.warning(f"Error processing profile: {e}")
-            # Skip this profile if there's an error
+        # Log the count to verify data was loaded
+        count = df.count()
+        logger.info(f"Created DataFrame with {count} profiles")
 
-    # Create DataFrame
-    profiles_df = spark.createDataFrame(profile_data, schema)
-    df_count = profiles_df.count()
-    logger.info(f"Created Spark DataFrame with {df_count} rows")
+        if count == 0:
+            logger.info("No profiles to process")
+            return []
 
-    # If no profiles were successfully processed, raise an error
-    if df_count == 0:
-        raise ValueError("No valid profiles could be processed")
+        # Create window spec for ranking - similar to RankingProfileMonthly.py
+        window_spec = Window.orderBy(
+            desc("totalPoints"),
+            asc("phone")  # Use phone as a tiebreaker for consistent ordering
+        )
 
-    return profiles_df
+        # Calculate unique ranks
+        ranked_df = df.withColumn("new_rank", row_number().over(window_spec))
 
+        # Filter to only profiles that need updating
+        updates_df = ranked_df.filter(col("new_rank") != col("rank"))
 
-def calculate_ranks_with_spark(spark, profiles_df):
-    """Calculate ranks using Spark's window functions"""
-    logger.info("Calculating ranks using Spark window functions")
+        # Get update count
+        update_count = updates_df.count()
+        logger.info(f"Found {update_count} profiles that need rank updates")
 
-    # Define window spec for ranking - order by total points descending
-    window_spec = Window.orderBy(desc("TotalPoints"))
+        # Show sample of rank changes
+        if update_count > 0:
+            logger.info("\nSample of rank changes:")
+            updates_df.select(
+                "phone",
+                "totalPoints",
+                "rank",
+                "new_rank"
+            ).orderBy("new_rank").show(10, truncate=False)
 
-    # Apply rank function to calculate new ranks
-    ranked_df = profiles_df.withColumn("new_rank", rank().over(window_spec))
+            # Check for duplicate ranks - should be none due to row_number()
+            duplicate_ranks = ranked_df.groupBy("new_rank").count().filter(col("count") > 1)
+            if duplicate_ranks.count() > 0:
+                logger.warning("Warning: Duplicate ranks found!")
+                duplicate_ranks.show()
+            else:
+                logger.info("Success: All ranks are unique!")
 
-    # Filter to only profiles that need updating
-    updates_df = ranked_df.filter(col("new_rank") != col("Rank"))
+        # Return updates as a list of tuples (id, new_rank)
+        updates = updates_df.select("id", "new_rank").collect()
+        return [(row["id"], row["new_rank"]) for row in updates]
 
-    update_count = updates_df.count()
-    logger.info(f"Found {update_count} profiles that need rank updates")
-
-    # Show sample of changes
-    if update_count > 0:
-        logger.info("Sample of rank changes:")
-        updates_df.select(
-            "Id", "Phone", "TotalPoints", "Rank", "new_rank"
-        ).orderBy("new_rank").show(10, truncate=False)
-
-    return updates_df
-
-
-def generate_update_batch(updates_df):
-    """Generate batch update data from the Spark DataFrame"""
-    if updates_df.count() == 0:
-        logger.info("No updates to process")
-        return []
-
-    # Collect the data for updates
-    updates = updates_df.select("Id", "new_rank").collect()
-    logger.info(f"Preparing batch update for {len(updates)} profiles")
-
-    # Create update batch data
-    current_time = datetime.now()
-    batch_data = []
-
-    for row in updates:
-        try:
-            # Validate data before adding to batch
-            if row["Id"] and row["new_rank"] is not None:
-                batch_data.append((
-                    int(row["new_rank"]),
-                    current_time,
-                    "ProfileRankUpdater",
-                    row["Id"]
-                ))
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Error preparing update for profile {row['Id']}: {e}")
-
-    logger.info(f"Generated {len(batch_data)} valid update statements")
-    return batch_data
+    except Exception as e:
+        logger.error(f"Error calculating unique ranks: {str(e)}")
+        raise
+    finally:
+        if spark:
+            spark.stop()
 
 
-def update_postgres_batch(batch_data):
-    """Execute batch update in PostgreSQL"""
-    if not batch_data:
-        logger.info("No updates to process")
+def update_ranks_in_postgres(updates, env):
+    """Update ranks in PostgreSQL"""
+    if not updates:
+        logger.info("No rank updates to apply")
         return 0
-
-    update_count = len(batch_data)
-    logger.info(f"Applying {update_count} rank updates to PostgreSQL")
-
-    update_query = """
-        UPDATE public."Profiles" 
-        SET "Rank" = %s, 
-            "LastModified" = %s, 
-            "LastModifiedBy" = %s 
-        WHERE "Id" = %s
-    """
 
     conn = None
     try:
-        conn = psycopg2.connect(**POSTGRES_CONFIG)
+        conn = get_postgres_connection(env)
+
+        # Prepare update query - similar to RankingProfileMonthly.py but adapted for Profiles table
+        update_query = """
+            UPDATE public."Profiles"
+            SET "Rank" = %s,
+                "LastModified" = %s,
+                "LastModifiedBy" = %s
+            WHERE "Id" = %s
+        """
+
+        # Prepare batch data
+        current_time = datetime.now()
+        modified_by = "ProfileRankUpdater"
+
+        batch_data = []
+        for profile_id, new_rank in updates:
+            batch_data.append(
+                (
+                    new_rank,
+                    current_time,
+                    modified_by,
+                    profile_id
+                )
+            )
+
+        # Execute batch update
         with conn.cursor() as cursor:
             execute_batch(cursor, update_query, batch_data, page_size=1000)
+
+        # Commit the transaction
         conn.commit()
-        logger.info(f"Successfully updated {update_count} profile ranks")
-        return update_count
+
+        logger.info(f"Successfully updated {len(updates)} profile ranks in PostgreSQL")
+        return len(updates)
+
     except Exception as e:
+        logger.error(f"Error updating ranks in PostgreSQL: {str(e)}")
         if conn:
             conn.rollback()
-        logger.error(f"Error updating profile ranks: {str(e)}")
         raise
     finally:
         if conn:
             conn.close()
 
 
-def update_ranks_with_spark():
-    """Main function to update profile ranks using Spark"""
-    start_time = time.time()
-    spark = None
+def main():
+    """Main entry point of the script"""
+    start_time = datetime.now()
 
     try:
-        # Initialize Spark session
-        spark = create_spark_session()
-        logger.info("Spark session initialized")
+        # Determine environment
+        env = get_environment()
+        logger.info(f"Starting Profile AllTime Ranking Process at {start_time} in {env.upper()} environment")
 
         # Fetch profiles from PostgreSQL
-        profiles = fetch_profiles_from_postgres()
+        profiles = fetch_profiles_from_postgres(env)
 
-        # If no profiles found, exit early
         if not profiles:
-            logger.info("No profiles found in the database. Nothing to process.")
+            logger.info("No profiles found in database. Nothing to process.")
             return
 
-        # Convert to Spark DataFrame
-        profiles_df = create_spark_dataframe_from_profiles(spark, profiles)
+        # Calculate ranks
+        rank_updates = calculate_unique_ranks(profiles, env)
 
-        # Calculate ranks using Spark window functions
-        updates_df = calculate_ranks_with_spark(spark, profiles_df)
+        # Update ranks in PostgreSQL
+        if rank_updates:
+            updated_count = update_ranks_in_postgres(rank_updates, env)
+            logger.info(f"Updated {updated_count} profile ranks")
+        else:
+            logger.info("No rank changes needed")
 
-        # If no updates needed, exit early
-        if updates_df.count() == 0:
-            logger.info("No rank changes detected. No updates needed.")
-            return
-
-        # Generate batch update data
-        batch_data = generate_update_batch(updates_df)
-
-        # If no valid updates after validation, exit early
-        if not batch_data:
-            logger.info("No valid updates after data validation. Nothing to process.")
-            return
-
-        # Execute batch update in PostgreSQL
-        updated_count = update_postgres_batch(batch_data)
-
-        # Log performance stats
-        end_time = time.time()
-        duration = end_time - start_time
-        logger.info(f"Processing complete. Total updated: {updated_count}")
-        logger.info(f"Total execution time: {duration:.2f} seconds")
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        logger.info(f"Profile AllTime Ranking Process Completed at {end_time}")
+        logger.info(f"Total duration: {duration:.2f} seconds")
 
     except Exception as e:
-        logger.error(f"Error in profile rank update: {str(e)}")
-        raise
-    finally:
-        if spark:
-            spark.stop()
-            logger.info("Spark session stopped")
-
-
-def main():
-    """Main entry point"""
-    logger.info("Starting Profile Rank Update Batch Process")
-
-    try:
-        # Update ranks using Spark
-        update_ranks_with_spark()
-        logger.info("Profile Rank Update Batch Process completed successfully")
-    except Exception as e:
-        logger.error(f"Profile Rank Update Batch Process failed: {str(e)}")
+        logger.error(f"Profile AllTime Ranking Process failed: {str(e)}")
         raise
 
 

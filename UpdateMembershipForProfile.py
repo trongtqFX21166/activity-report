@@ -7,6 +7,7 @@ import pytz
 import argparse
 import sys
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -16,33 +17,21 @@ logging.basicConfig(
 logger = logging.getLogger("UpdateMembershipCode")
 
 
-def create_spark_session():
-    """Create Spark session with MongoDB configurations"""
-    return SparkSession.builder \
-        .appName("update_profile_membership_code") \
-        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
-        .config("spark.mongodb.read.connection.uri", "mongodb://192.168.10.97:27017") \
-        .config("spark.mongodb.read.database", "activity_membershiptransactionmonthly_dev") \
-        .getOrCreate()
-
-
-def get_postgres_connection():
-    """Get connection to PostgreSQL database"""
-    return psycopg2.connect(
-        host="192.168.8.230",
-        database="TrongTestDB1",
-        user="postgres",
-        password="admin123."
-    )
-
-
 def parse_arguments():
     """Parse command line arguments for year and month"""
     parser = argparse.ArgumentParser(description='Update Profile Membership Codes')
     parser.add_argument('--year', type=int, help='Year to process')
     parser.add_argument('--month', type=int, help='Month to process')
+    parser.add_argument('--env', choices=['dev', 'prod'], default='dev', help='Environment (dev or prod)')
 
-    args = parser.parse_args()
+    # Parse known args to handle cases where additional arguments exist
+    args, _ = parser.parse_known_args()
+
+    # If environment not specified in args, check environment variables
+    if not args.env:
+        env = os.environ.get('ENVIRONMENT', 'dev').lower()
+        if env in ['dev', 'prod']:
+            args.env = env
 
     # If arguments not provided, use current month/year
     if args.year is None or args.month is None:
@@ -56,11 +45,89 @@ def parse_arguments():
         logger.error(f"Invalid month: {args.month}. Month must be between 1 and 12.")
         sys.exit(1)
 
-    logger.info(f"Processing data for month: {args.month}, year: {args.year}")
-    return args.year, args.month
+    logger.info(f"Processing data for month: {args.month}, year: {args.year}, environment: {args.env}")
+    return args
 
 
-def update_postgres_membership_codes(membership_data, batch_size=1000):
+def get_mongodb_config(env):
+    """Return MongoDB configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            'host': 'mongodb://192.168.10.97:27017',
+            'database': 'activity_membershiptransactionmonthly_dev'
+        }
+    else:  # prod
+        return {
+            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
+            'database': 'activity_membershiptransactionmonthly',
+            'auth_source': 'admin'
+        }
+
+
+def get_postgres_config(env):
+    """Return PostgreSQL configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            "host": "192.168.8.230",
+            "database": "TrongTestDB1",
+            "user": "postgres",
+            "password": "admin123."
+        }
+    else:  # prod
+        return {
+            "host": "192.168.11.83",
+            "database": "ActivityDB",
+            "user": "vmladmin",
+            "password": "5d6v6hiFGGns4onnZGW0VfKe"
+        }
+
+
+def create_spark_session(app_name, env):
+    """Create Spark session with MongoDB configurations"""
+    mongo_config = get_mongodb_config(env)
+
+    builder = SparkSession.builder \
+        .appName(f"{app_name}-{env}") \
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
+        .config("spark.mongodb.read.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
+        .config("spark.mongodb.write.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
+        .config("spark.mongodb.read.database", mongo_config['database']) \
+        .config("spark.mongodb.write.database", mongo_config['database'])
+
+    # Add authentication for production
+    if env == 'prod' and 'auth_source' in mongo_config:
+        builder = builder \
+            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
+
+    return builder.getOrCreate()
+
+
+def get_postgres_connection(env):
+    """Get connection to PostgreSQL database"""
+    postgres_config = get_postgres_config(env)
+    try:
+        conn = psycopg2.connect(**postgres_config)
+        return conn
+    except Exception as e:
+        logger.error(f"Error connecting to PostgreSQL: {str(e)}")
+        raise
+
+
+def validate_month_year(month, year):
+    """Validate month and year parameters"""
+    try:
+        if not (1 <= month <= 12):
+            raise ValueError(f"Month must be between 1 and 12, got {month}")
+
+        # Create a date object to validate the date
+        datetime(year, month, 1)
+        return True
+    except ValueError as e:
+        logger.error(f"Invalid month/year: {str(e)}")
+        return False
+
+
+def update_postgres_membership_codes(membership_data, env, batch_size=1000):
     """Update membership codes in PostgreSQL profiles table"""
     # Prepare the update SQL
     update_query = """
@@ -76,7 +143,7 @@ def update_postgres_membership_codes(membership_data, batch_size=1000):
 
     conn = None
     try:
-        conn = get_postgres_connection()
+        conn = get_postgres_connection(env)
         with conn.cursor() as cur:
             # Prepare batch data
             batch_data = [
@@ -105,12 +172,12 @@ def update_postgres_membership_codes(membership_data, batch_size=1000):
             conn.close()
 
 
-def get_mongodb_membership_data(year, month):
+def get_mongodb_membership_data(year, month, env):
     """Get membership data from MongoDB using Spark"""
     spark = None
     try:
         # Initialize Spark
-        spark = create_spark_session()
+        spark = create_spark_session("update_profile_membership", env)
 
         # Collection name based on year and month
         collection_name = f"{year}_{month}"
@@ -169,18 +236,23 @@ def main():
 
     try:
         # Parse arguments
-        year, month = parse_arguments()
+        args = parse_arguments()
+
+        # Validate month and year
+        if not validate_month_year(args.month, args.year):
+            logger.error(f"Invalid month/year combination: {args.month}/{args.year}")
+            sys.exit(1)
 
         # Get membership data using PySpark
-        logger.info("Using Spark to read MongoDB data")
-        membership_data = get_mongodb_membership_data(year, month)
+        logger.info(f"Using Spark to read MongoDB data from {args.env} environment")
+        membership_data = get_mongodb_membership_data(args.year, args.month, args.env)
 
         if not membership_data:
             logger.warning("No membership data to update. Exiting.")
             return
 
         # Update PostgreSQL profiles
-        updated_count = update_postgres_membership_codes(membership_data)
+        updated_count = update_postgres_membership_codes(membership_data, args.env)
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()

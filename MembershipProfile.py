@@ -8,36 +8,103 @@ import sys
 import argparse
 from datetime import datetime
 import pytz
+import logging
 
-os.environ[
-    'PYSPARK_SUBMIT_ARGS'] = '--packages io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-streaming_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:3.0.1 pyspark-shell'
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("MembershipProfile")
 
 
-def create_spark_session(app_name):
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Process membership ranking and update membership codes')
+    parser.add_argument('--month', type=int, help='Month to process (1-12)')
+    parser.add_argument('--year', type=int, help='Year to process (e.g., 2024)')
+    parser.add_argument('--env', choices=['dev', 'prod'], default='dev', help='Environment (dev or prod)')
+
+    # Parse known args to handle cases where additional arguments exist
+    args, _ = parser.parse_known_args()
+
+    # If environment not specified in args, check environment variables
+    if not args.env:
+        env = os.environ.get('ENVIRONMENT', 'dev').lower()
+        if env in ['dev', 'prod']:
+            args.env = env
+
+    return args
+
+
+def get_mongodb_config(env):
+    """Return MongoDB configuration for the specified environment"""
+    if env == 'dev':
+        return {
+            'uri': 'mongodb://192.168.10.97:27017',
+            'database': 'activity_membershiptransactionmonthly_dev'
+        }
+    else:  # prod
+        # Include the authSource in the connection string directly
+        return {
+            'uri': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017/?authSource=admin',
+            'database': 'activity_membershiptransactionmonthly'
+        }
+
+
+def create_spark_session(app_name, env):
     """Create Spark session with MongoDB configurations"""
-    return SparkSession.builder \
+    mongo_config = get_mongodb_config(env)
+
+    logger.info(f"Creating Spark session with MongoDB configuration for {env} environment")
+
+    # Create basic SparkSession builder
+    spark_builder = SparkSession.builder \
         .appName(app_name) \
         .config("hive.metastore.uris", "thrift://192.168.10.167:9083") \
         .config("spark.sql.warehouse.dir", "/users/hive/warehouse") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .config("spark.mongodb.read.connection.uri",
-                "mongodb://192.168.10.97:27017/activity_membershiptransactionmonthly_dev") \
-        .config("spark.mongodb.write.connection.uri",
-                "mongodb://192.168.10.97:27017/activity_membershiptransactionmonthly_dev") \
-        .config("spark.mongodb.read.database", "activity_membershiptransactionmonthly_dev") \
-        .config("spark.mongodb.write.database", "activity_membershiptransactionmonthly_dev") \
-        .enableHiveSupport() \
-        .getOrCreate()
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
+
+    # Configure MongoDB connection
+    spark_builder = spark_builder \
+        .config("spark.mongodb.connection.uri", mongo_config['uri']) \
+        .config("spark.mongodb.database", mongo_config['database'])
+
+    # Create the session
+    spark = spark_builder.enableHiveSupport().getOrCreate()
+    logger.info(f"Successfully created Spark session with app ID: {spark.sparkContext.applicationId}")
+
+    return spark
+
+def get_mongodb_connection(env):
+    """Create MongoDB client connection"""
+    try:
+        mongo_config = get_mongodb_config(env)
+        logger.info(f"Connecting to MongoDB for {env} environment: {mongo_config['uri'].split('@')[-1]}")
+
+        # Create client using the connection string
+        client = MongoClient(mongo_config['uri'])
+
+        # Test connection
+        client.admin.command('ping')
+        logger.info(f"Successfully connected to MongoDB ({env} environment)")
+        return client
+    except Exception as e:
+        logger.error(f"Error connecting to MongoDB: {str(e)}")
+        raise
 
 
 def get_membership_mapping():
     """Define membership levels based on rank percentiles"""
     return [
-        (0.00, 0.01, "Level4", "Nổi tiếng"),  # Top 1%
-        (0.01, 0.05, "Level3", "Uy tín"),  # Next 4%
-        (0.05, 0.15, "Level2", "Ngôi sao đang lên"),  # Next 10%
-        (0.15, 1.00, "Level1", "Nhập môn")  # Remaining 85%
+        (0.00, 0.01, "Level5", "Tối thượng"),  # Top 1%
+        (0.01, 0.05, "Level4", "Nổi tiếng"),  # Top 4%
+        (0.05, 0.10, "Level3", "Uy tín"),  # Top 10%
     ]
 
 
@@ -58,20 +125,63 @@ def validate_month_year(month, year):
         datetime(year, month, 1)
         return True
     except ValueError as e:
-        print(f"Error validating month/year: {str(e)}")
+        logger.error(f"Error validating month/year: {str(e)}")
         return False
 
 
+def read_from_mongodb(spark, month, year, env):
+    """Read data from MongoDB with specified month/year filter"""
+    # Define collection name based on year_month format
+    collection_name = f"{year}_{month}"
+
+    try:
+        logger.info(f"Reading from MongoDB collection: {collection_name} in {env} environment")
+
+        mongo_config = get_mongodb_config(env)
+        logger.info(f"Using database: {mongo_config['database']}")
+
+        # Use the MongoDB connector with the right configuration
+        df = spark.read \
+            .format("mongodb") \
+            .option("collection", collection_name) \
+            .load()
+
+        # Check if we have data
+        count = df.count()
+        logger.info(f"Found {count} records in MongoDB collection {collection_name}")
+
+        # Show schema for debugging
+        if count > 0:
+            logger.info("Collection schema:")
+            df.printSchema()
+
+        return df
+    except Exception as e:
+        logger.error(f"Error reading from MongoDB: {str(e)}")
+        # Create an empty dataframe with expected schema
+        schema = StructType([
+            StructField("phone", StringType(), True),
+            StructField("membershipcode", StringType(), True),
+            StructField("membershipname", StringType(), True),
+            StructField("month", IntegerType(), True),
+            StructField("year", IntegerType(), True),
+            StructField("rank", IntegerType(), True),
+            StructField("totalpoints", IntegerType(), True),
+            StructField("timestamp", LongType(), True)
+        ])
+        return spark.createDataFrame([], schema)
+
+
 def assign_membership_levels(df):
-    """Assign membership levels based on rank percentiles"""
+    """Assign membership levels based on rank percentiles and point thresholds"""
     # Calculate total number of users
     total_users = df.count()
 
     if total_users == 0:
-        print("No users found in the dataset")
+        logger.info("No users found in the dataset")
         return df
 
-    print(f"Total users for selected period: {total_users}")
+    logger.info(f"Total users for selected period: {total_users}")
 
     # Calculate rank first
     window_spec = Window.orderBy(desc("totalpoints"))
@@ -81,17 +191,32 @@ def assign_membership_levels(df):
     ranked_df = df \
         .withColumn("percentile", col("rank") / total_users)
 
-    # Apply membership rules based on percentiles
+    # Apply membership rules based on percentiles first
     mappings = get_membership_mapping()
     membership_conditions = []
 
     for min_perc, max_perc, code, name in mappings:
         condition = (
-            when((col("percentile") > min_perc) & (col("percentile") <= max_perc),
+            when((col("percentile") > min_perc) & (col("percentile") <= max_perc) & (col("totalpoints") >= 200),
                  struct(lit(code).alias("code"), lit(name).alias("name")))
         )
         membership_conditions.append(condition)
 
+    # Add absolute points threshold for Level2
+    level2_condition = when(
+        col("totalpoints") >= 200,
+        struct(lit("Level2").alias("code"), lit("Ngôi sao đang lên").alias("name"))
+    )
+    membership_conditions.append(level2_condition)
+
+    # Default to Level1 for everyone else
+    level1_condition = when(
+        lit(True),
+        struct(lit("Level1").alias("code"), lit("Nhập môn").alias("name"))
+    )
+    membership_conditions.append(level1_condition)
+
+    # Apply all conditions with coalesce to prioritize them in order
     membership_expr = coalesce(*membership_conditions)
 
     return ranked_df \
@@ -101,7 +226,7 @@ def assign_membership_levels(df):
         .drop("membership")
 
 
-def update_membership_status(month=None, year=None):
+def update_membership_status(month=None, year=None, env='dev'):
     """Update membership status for specified month and year"""
     spark = None
     client = None
@@ -113,35 +238,32 @@ def update_membership_status(month=None, year=None):
 
         # Validate month and year
         if not validate_month_year(month, year):
-            print(f"Invalid month/year combination: {month}/{year}")
+            logger.error(f"Invalid month/year combination: {month}/{year}")
             return False
 
-        print(f"Processing data for month: {month}, year: {year}")
+        logger.info(f"Processing data for month: {month}, year: {year}, environment: {env}")
 
         # Initialize Spark
-        spark = create_spark_session(f"membership_rank_updater_{year}_{month}")
+        app_name = f"membership_rank_updater_{year}_{month}_{env}"
+        spark = create_spark_session(app_name, env)
 
         # Initialize MongoDB client
-        client = MongoClient('mongodb://192.168.10.97:27017/')
-        db = client['activity_membershiptransactionmonthly_dev']
+        client = get_mongodb_connection(env)
+        mongo_config = get_mongodb_config(env)
+        db = client[mongo_config['database']]
         collection_name = f"{year}_{month}"
         collection = db[collection_name]
 
-        # Read specified month's data from MongoDB
-        monthly_data = spark.read \
-            .format("mongodb") \
-            .option("uri", "mongodb://192.168.10.97:27017/activity_membershiptransactionmonthly_dev") \
-            .option("database", "activity_membershiptransactionmonthly_dev") \
-            .option("collection", collection_name) \
-            .load()
+        # Read specified month's data from MongoDB using the dedicated function
+        monthly_data = read_from_mongodb(spark, month, year, env)
 
         # Check if we have data for specified month
         record_count = monthly_data.count()
         if record_count == 0:
-            print(f"No data found for month {month}, year {year}")
+            logger.warning(f"No data found for month {month}, year {year}")
             return False
 
-        print(f"Found {record_count} records to process")
+        logger.info(f"Found {record_count} records to process")
 
         # Calculate and apply new membership levels
         membership_updates = assign_membership_levels(monthly_data)
@@ -181,20 +303,23 @@ def update_membership_status(month=None, year=None):
                 )
             )
 
-        # Create unique index on phone field for the collection if it doesn't exist
+        # Create indices to ensure performance
         try:
             collection.create_index([("phone", 1)], unique=True)
+            collection.create_index([("rank", 1)])
+            collection.create_index([("totalpoints", -1)])
         except Exception as e:
-            print(f"Note: Index creation - {str(e)}")
+            logger.warning(f"Index creation note: {str(e)}")
 
         # Execute bulk update
         if bulk_operations:
             try:
                 result = collection.bulk_write(bulk_operations, ordered=False)
-                print(f"MongoDB Update Results - Modified: {result.modified_count}, Upserted: {result.upserted_count}")
+                logger.info(
+                    f"MongoDB Update Results - Modified: {result.modified_count}, Upserted: {result.upserted_count}")
             except Exception as e:
                 if "duplicate key error" in str(e):
-                    print("Warning: Duplicate phone numbers detected. Handling duplicates...")
+                    logger.warning("Warning: Duplicate phone numbers detected. Handling duplicates...")
                     # Handle duplicates by keeping the record with the highest points
                     deduped_updates = final_updates.dropDuplicates(["phone"], "totalpoints")
 
@@ -212,12 +337,14 @@ def update_membership_status(month=None, year=None):
 
                     # Retry bulk write with deduplicated data
                     result = collection.bulk_write(bulk_operations, ordered=False)
-                    print(f"After deduplication - Modified: {result.modified_count}, Upserted: {result.upserted_count}")
+                    logger.info(
+                        f"After deduplication - Modified: {result.modified_count}, Upserted: {result.upserted_count}")
                 else:
+                    logger.error(f"Error in bulk write: {str(e)}")
                     raise
 
         # Show statistics
-        print("\nMembership Level Distribution:")
+        logger.info("\nMembership Level Distribution:")
         final_updates.groupBy("membershipCode", "membershipName") \
             .agg(
             count("*").alias("user_count"),
@@ -229,7 +356,7 @@ def update_membership_status(month=None, year=None):
             .show(truncate=False)
 
         # Show sample updates
-        print("\nSample Records (sorted by points):")
+        logger.info("\nSample Records (sorted by points):")
         final_updates.orderBy(desc("totalpoints")) \
             .select(
             "phone",
@@ -243,7 +370,7 @@ def update_membership_status(month=None, year=None):
         return True
 
     except Exception as e:
-        print(f"Error updating membership status: {str(e)}")
+        logger.error(f"Error updating membership status: {str(e)}")
         return False
     finally:
         if spark:
@@ -252,47 +379,44 @@ def update_membership_status(month=None, year=None):
             client.close()
 
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Process membership ranking for a specific month and year')
-    parser.add_argument('--month', type=int, help='Month (1-12)')
-    parser.add_argument('--year', type=int, help='Year (e.g., 2024)')
-
-    args = parser.parse_args()
-
-    # If one parameter is provided but not the other, use current date for missing parameter
-    if (args.month is None and args.year is not None) or (args.month is not None and args.year is None):
-        default_month, default_year = get_default_month_year()
-        if args.month is None:
-            args.month = default_month
-            print(f"Month not specified, using current month: {args.month}")
-        if args.year is None:
-            args.year = default_year
-            print(f"Year not specified, using current year: {args.year}")
-
-    return args
-
-
 def main():
     """Main entry point of the script"""
-    # Parse command line arguments
-    args = parse_arguments()
+    start_time = datetime.now()
 
-    # If no arguments provided, use current month and year
-    if args.month is None and args.year is None:
-        month, year = get_default_month_year()
-        print(f"No month/year specified, using current date: {month}/{year}")
-    else:
-        month, year = args.month, args.year
+    try:
+        # Parse command line arguments
+        args = parse_arguments()
 
-    print(f"Starting membership status update process for {month}/{year}")
-    success = update_membership_status(month, year)
+        # If no month/year provided, use current
+        month = args.month
+        year = args.year
+        env = args.env
 
-    if success:
-        print(f"Membership status update process completed successfully for {month}/{year}")
-        sys.exit(0)
-    else:
-        print(f"Membership status update process failed for {month}/{year}")
+        if month is None or year is None:
+            curr_month, curr_year = get_default_month_year()
+            month = month or curr_month
+            year = year or curr_year
+
+        logger.info(
+            f"Starting membership status update process for {month}/{year} in {env} environment at {start_time}")
+
+        # Process membership update
+        success = update_membership_status(month, year, env)
+
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+
+        if success:
+            logger.info(f"Membership status update process completed successfully for {month}/{year}")
+            logger.info(f"Total duration: {duration:.2f} seconds")
+            sys.exit(0)
+        else:
+            logger.error(f"Membership status update process failed for {month}/{year}")
+            logger.info(f"Total duration: {duration:.2f} seconds")
+            sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"Unhandled exception: {str(e)}")
         sys.exit(1)
 
 
