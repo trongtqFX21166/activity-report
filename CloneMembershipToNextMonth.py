@@ -3,115 +3,29 @@ from pyspark.sql.functions import *
 from datetime import datetime
 import calendar
 import sys
-import argparse
-import os
 from pymongo import MongoClient, UpdateOne, InsertOne
 import pytz
-import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("CloneMembershipToNextMonth")
 
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Clone membership data from one month to the next')
-    parser.add_argument('--source-month', type=int, help='Source month (1-12)')
-    parser.add_argument('--source-year', type=int, help='Source year (e.g., 2024)')
-    parser.add_argument('--target-month', type=int, help='Target month (1-12), defaults to next month')
-    parser.add_argument('--target-year', type=int, help='Target year (e.g., 2024), defaults to appropriate year')
-    parser.add_argument('--env', choices=['dev', 'prod'], default='dev', help='Environment (dev or prod)')
-
-    # Handle positional arguments for backward compatibility
-    if len(sys.argv) > 1 and sys.argv[1].isdigit():
-        # Old style: script.py source_month source_year [target_month target_year]
-        args = []
-        if len(sys.argv) > 1:
-            args.extend(['--source-month', sys.argv[1]])
-        if len(sys.argv) > 2:
-            args.extend(['--source-year', sys.argv[2]])
-        if len(sys.argv) > 3:
-            args.extend(['--target-month', sys.argv[3]])
-        if len(sys.argv) > 4:
-            args.extend(['--target-year', sys.argv[4]])
-
-        # Parse with our custom args list
-        args = parser.parse_args(args)
-    else:
-        # Parse normally with command line args
-        args = parser.parse_args()
-
-    # Check environment variables if environment not specified
-    if not hasattr(args, 'env') or not args.env:
-        env = os.environ.get('ENVIRONMENT', 'dev').lower()
-        if env in ['dev', 'prod']:
-            args.env = env
-
-    return args
-
-
-def get_mongodb_config(env):
-    """Return MongoDB configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            'host': 'mongodb://192.168.10.97:27017',
-            'database': 'activity_membershiptransactionmonthly_dev'
-        }
-    else:  # prod
-        return {
-            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
-            'database': 'activity_membershiptransactionmonthly',
-            'auth_source': 'admin'
-        }
-
-
-def create_spark_session(env):
+def create_spark_session():
     """Create Spark session with MongoDB configurations"""
-    mongo_config = get_mongodb_config(env)
-
-    builder = SparkSession.builder \
-        .appName(f"membership-monthly-cloner-{env}") \
+    return SparkSession.builder \
+        .appName("membership-monthly-cloner") \
         .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
-        .config("spark.mongodb.read.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.write.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.read.database", mongo_config['database']) \
-        .config("spark.mongodb.write.database", mongo_config['database'])
-
-    # Add authentication for production
-    if env == 'prod' and 'auth_source' in mongo_config:
-        builder = builder \
-            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
-
-    return builder.getOrCreate()
+        .config("spark.mongodb.read.connection.uri", "mongodb://192.168.10.97:27017") \
+        .config("spark.mongodb.write.connection.uri", "mongodb://192.168.10.97:27017") \
+        .config("spark.mongodb.read.database", "activity_membershiptransactionmonthly_dev") \
+        .config("spark.mongodb.write.database", "activity_membershiptransactionmonthly_dev") \
+        .getOrCreate()
 
 
-def get_mongodb_connection(env):
+def get_mongodb_connection():
     """Create MongoDB client connection"""
     try:
-        mongo_config = get_mongodb_config(env)
-
-        # Create client with appropriate authentication
-        if env == 'dev':
-            client = MongoClient(mongo_config['host'])
-        else:  # prod
-            client = MongoClient(
-                mongo_config['host'],
-                authSource=mongo_config['auth_source']
-            )
-
-        # Test connection
-        client.admin.command('ping')
-        logger.info(f"Successfully connected to MongoDB ({env} environment)")
-        return client, mongo_config['database']
+        client = MongoClient('mongodb://192.168.10.97:27017/')
+        return client
     except Exception as e:
-        logger.error(f"Error connecting to MongoDB: {str(e)}")
+        print(f"Error connecting to MongoDB: {str(e)}")
         raise
 
 
@@ -126,17 +40,17 @@ def validate_date(month, year):
     """Validate if the provided month and year are valid"""
     try:
         if not (1 <= month <= 12):
-            raise ValueError(f"Month must be between 1 and 12, got {month}")
+            raise ValueError("Month must be between 1 and 12")
 
         # Create date object to validate year
         datetime(year, month, 1)
         return True
     except ValueError as e:
-        logger.error(f"Invalid date: {str(e)}")
+        print(f"Invalid date: {str(e)}")
         return False
 
 
-def clone_monthly_data(source_month, source_year, target_month=None, target_year=None, env='dev'):
+def clone_monthly_data(source_month, source_year, target_month=None, target_year=None):
     """Clone membership transaction data from source month to target month"""
     spark = None
     mongo_client = None
@@ -154,13 +68,12 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
         if not validate_date(target_month, target_year):
             raise ValueError(f"Invalid target date: month={target_month}, year={target_year}")
 
-        logger.info(
-            f"Cloning data from {source_month}/{source_year} to {target_month}/{target_year} in {env} environment")
+        print(f"Cloning data from {source_month}/{source_year} to {target_month}/{target_year}")
 
         # Initialize connections
-        spark = create_spark_session(env)
-        mongo_client, db_name = get_mongodb_connection(env)
-        db = mongo_client[db_name]
+        spark = create_spark_session()
+        mongo_client = get_mongodb_connection()
+        db = mongo_client['activity_membershiptransactionmonthly_dev']
 
         # Define collection names
         source_collection = f"{source_year}_{source_month}"
@@ -175,10 +88,10 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
         # Check if source data exists
         source_count = source_data.count()
         if source_count == 0:
-            logger.warning(f"No data found for source month {source_month}/{source_year}")
+            print(f"No data found for source month {source_month}/{source_year}")
             return
 
-        logger.info(f"Found {source_count} records in source month")
+        print(f"Found {source_count} records in source month")
 
         # Calculate timestamp for first day of target month
         target_timestamp = int(
@@ -228,19 +141,19 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
                     total_upserted += result.upserted_count
                     total_modified += result.modified_count
                     total_matched += result.matched_count
-                    logger.info(
+                    print(
                         f"Processed batch {i // batch_size + 1}/{(len(bulk_operations) + batch_size - 1) // batch_size}: "
                         f"Upserted: {result.upserted_count}, Modified: {result.modified_count}, "
                         f"Matched: {result.matched_count}")
                 except Exception as e:
-                    logger.error(f"Error processing batch {i // batch_size + 1}: {str(e)}")
+                    print(f"Error processing batch {i // batch_size + 1}: {str(e)}")
                     # Continue with next batch instead of failing entire process
 
-            logger.info(f"\nBulk operation results:")
-            logger.info(f"  Upserted: {total_upserted}")
-            logger.info(f"  Modified: {total_modified}")
-            logger.info(f"  Matched: {total_matched}")
-            logger.info(f"  Total processed: {total_upserted + total_modified}")
+            print(f"\nBulk operation results:")
+            print(f"  Upserted: {total_upserted}")
+            print(f"  Modified: {total_modified}")
+            print(f"  Matched: {total_matched}")
+            print(f"  Total processed: {total_upserted + total_modified}")
 
         # Create indexes on the collection
         target_coll = db[target_collection]
@@ -248,10 +161,10 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
         target_coll.create_index([("rank", 1)])
         target_coll.create_index([("totalpoints", -1)])
 
-        logger.info(f"Successfully cloned data to {target_month}/{target_year}")
+        print(f"Successfully cloned data to {target_month}/{target_year}")
 
         # Show sample of cloned data
-        logger.info("\nSample of cloned records:")
+        print("\nSample of cloned records:")
         target_data.select(
             "phone",
             "membershipcode",
@@ -263,11 +176,9 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
             "timestamp"
         ).show(5, truncate=False)
 
-        return True
-
     except Exception as e:
-        logger.error(f"Error cloning monthly data: {str(e)}")
-        return False
+        print(f"Error cloning monthly data: {str(e)}")
+        raise
     finally:
         if spark:
             spark.stop()
@@ -276,42 +187,20 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
 
 
 def main():
-    start_time = datetime.now()
-    logger.info(f"Starting Membership Monthly Clone Process at {start_time}")
-
-    try:
-        # Parse arguments
-        args = parse_arguments()
-
-        # Validate that we have source month/year
-        if not args.source_month or not args.source_year:
-            logger.error("Source month and year are required")
-            sys.exit(1)
-
-        # Clone data
-        success = clone_monthly_data(
-            args.source_month,
-            args.source_year,
-            args.target_month,
-            args.target_year,
-            args.env
-        )
-
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
-
-        if success:
-            logger.info(f"Clone Process Completed Successfully at {end_time}")
-            logger.info(f"Total duration: {duration:.2f} seconds")
-            sys.exit(0)
-        else:
-            logger.error(f"Clone Process Failed at {end_time}")
-            logger.info(f"Total duration: {duration:.2f} seconds")
-            sys.exit(1)
-
-    except Exception as e:
-        logger.error(f"Unhandled exception: {str(e)}")
+    # Check command line arguments
+    if len(sys.argv) < 3:
+        print("Usage: script.py <source_month> <source_year> [target_month] [target_year]")
         sys.exit(1)
+
+    source_month = int(sys.argv[1])
+    source_year = int(sys.argv[2])
+
+    target_month = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    target_year = int(sys.argv[4]) if len(sys.argv) > 4 else None
+
+    print(f"Starting Membership Monthly Clone Process at {datetime.now()}")
+    clone_monthly_data(source_month, source_year, target_month, target_year)
+    print(f"Clone Process Completed at {datetime.now()}")
 
 
 if __name__ == "__main__":

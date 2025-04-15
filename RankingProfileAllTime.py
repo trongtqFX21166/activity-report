@@ -8,7 +8,6 @@ import psycopg2
 from psycopg2.extras import execute_batch, RealDictCursor
 import logging
 import os
-import sys
 
 # Configure logging
 logging.basicConfig(
@@ -17,88 +16,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ProfileRankUpdater")
 
-
-# Environment-specific configurations
-def get_environment():
-    """
-    Determine the execution environment (dev or prod).
-    Can be specified as a command-line argument or environment variable.
-    Defaults to 'dev' if not specified.
-    """
-    # Check command line arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
-        return sys.argv[1].lower()
-
-    # Check environment variables
-    env = os.environ.get('ENVIRONMENT', 'dev').lower()
-    if env in ['dev', 'prod']:
-        return env
-
-    # Default to dev
-    return 'dev'
+# Configuration
+POSTGRES_CONFIG = {
+    "host": "192.168.8.230",
+    "database": "TrongTestDB1",
+    "user": "postgres",
+    "password": "admin123."
+}
 
 
-def get_postgres_config(env):
-    """Return PostgreSQL configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            "host": "192.168.8.230",
-            "database": "TrongTestDB1",
-            "user": "postgres",
-            "password": "admin123."
-        }
-    else:  # prod
-        return {
-            "host": "192.168.11.83",
-            "database": "ActivityDB",
-            "user": "vmladmin",
-            "password": "5d6v6hiFGGns4onnZGW0VfKe"
-        }
-
-
-def create_spark_session(env):
-    """Create a Spark session with environment-specific configuration"""
-    app_name = f"ProfileRankUpdater-{env}"
-
+def create_spark_session():
+    """Create a Spark session"""
     return SparkSession.builder \
-        .appName(app_name) \
+        .appName("ProfileRankUpdater") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
 
 
-def get_postgres_connection(env):
-    """Create a connection to PostgreSQL database using environment-specific config"""
-    try:
-        config = get_postgres_config(env)
-        conn = psycopg2.connect(**config)
-        return conn
-    except Exception as e:
-        logger.error(f"Error connecting to PostgreSQL: {str(e)}")
-        raise
-
-
-def get_current_datetime_epoch():
-    """Get current date and time information in seconds since epoch"""
-    now = datetime.now()
-    timestamp = int(time.time())
-    date_timestamp = int(datetime(now.year, now.month, now.day).timestamp())
-
-    return {
-        "timestamp": timestamp,
-        "date_timestamp": date_timestamp,
-        "month": now.month,
-        "year": now.year
-    }
-
-
-def fetch_profiles_from_postgres(env):
+def fetch_profiles_from_postgres():
     """Fetch profiles directly from PostgreSQL"""
-    logger.info(f"Fetching profiles from PostgreSQL ({env} environment)")
+    logger.info("Fetching profiles from PostgreSQL")
 
     conn = None
     try:
-        conn = get_postgres_connection(env)
+        conn = psycopg2.connect(**POSTGRES_CONFIG)
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
                 'SELECT "Id", "Phone", "TotalPoints", "Rank", "MembershipCode" FROM public."Profiles"'
@@ -261,14 +203,14 @@ def generate_update_batch(updates_df):
     return batch_data
 
 
-def update_postgres_batch(batch_data, env):
+def update_postgres_batch(batch_data):
     """Execute batch update in PostgreSQL"""
     if not batch_data:
         logger.info("No updates to process")
         return 0
 
     update_count = len(batch_data)
-    logger.info(f"Applying {update_count} rank updates to PostgreSQL in {env} environment")
+    logger.info(f"Applying {update_count} rank updates to PostgreSQL")
 
     update_query = """
         UPDATE public."Profiles" 
@@ -280,7 +222,7 @@ def update_postgres_batch(batch_data, env):
 
     conn = None
     try:
-        conn = get_postgres_connection(env)
+        conn = psycopg2.connect(**POSTGRES_CONFIG)
         with conn.cursor() as cursor:
             execute_batch(cursor, update_query, batch_data, page_size=1000)
         conn.commit()
@@ -296,18 +238,18 @@ def update_postgres_batch(batch_data, env):
             conn.close()
 
 
-def update_ranks_with_spark(env):
+def update_ranks_with_spark():
     """Main function to update profile ranks using Spark"""
     start_time = time.time()
     spark = None
 
     try:
         # Initialize Spark session
-        spark = create_spark_session(env)
-        logger.info(f"Spark session initialized for {env} environment")
+        spark = create_spark_session()
+        logger.info("Spark session initialized")
 
         # Fetch profiles from PostgreSQL
-        profiles = fetch_profiles_from_postgres(env)
+        profiles = fetch_profiles_from_postgres()
 
         # If no profiles found, exit early
         if not profiles:
@@ -334,7 +276,7 @@ def update_ranks_with_spark(env):
             return
 
         # Execute batch update in PostgreSQL
-        updated_count = update_postgres_batch(batch_data, env)
+        updated_count = update_postgres_batch(batch_data)
 
         # Log performance stats
         end_time = time.time()
@@ -353,16 +295,14 @@ def update_ranks_with_spark(env):
 
 def main():
     """Main entry point"""
-    # Determine environment
-    env = get_environment()
-    logger.info(f"Starting Profile Rank Update Process in {env.upper()} environment")
+    logger.info("Starting Profile Rank Update Batch Process")
 
     try:
         # Update ranks using Spark
-        update_ranks_with_spark(env)
-        logger.info(f"Profile Rank Update Process completed successfully in {env.upper()} environment")
+        update_ranks_with_spark()
+        logger.info("Profile Rank Update Batch Process completed successfully")
     except Exception as e:
-        logger.error(f"Profile Rank Update Process failed in {env.upper()} environment: {str(e)}")
+        logger.error(f"Profile Rank Update Batch Process failed: {str(e)}")
         raise
 
 

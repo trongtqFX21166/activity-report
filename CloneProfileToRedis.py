@@ -2,14 +2,6 @@
 """
 CloneProfileToRedis.py - Loads profiles from PostgreSQL to Redis
 Compatible with Spark cluster mode deployment via Airflow
-
-Usage:
-    spark-submit CloneProfileToRedis.py --month [MONTH] --year [YEAR] --env [dev|prod]
-
-Parameters:
-    --month      : Month (for logging purposes), defaults to current month
-    --year       : Year (for logging purposes), defaults to current year
-    --env        : Environment to use (dev or prod), defaults to 'dev'
 """
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
@@ -30,92 +22,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ProfileRedisLoader")
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("ProfileRedisLoader")
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Clone profiles from PostgreSQL to Redis')
-    parser.add_argument('--month', type=int, help='Month (for logging purposes)', default=datetime.now().month)
-    parser.add_argument('--year', type=int, help='Year (for logging purposes)', default=datetime.now().year)
-    parser.add_argument('--env', choices=['dev', 'prod'], default='dev', help='Environment (dev or prod)')
+# Configuration
+POSTGRES_CONFIG = {
+    "host": "192.168.8.230",
+    "database": "TrongTestDB1",
+    "user": "postgres",
+    "password": "admin123."
+}
 
-    args = parser.parse_args()
+REDIS_CONFIG = {
+    'host': '192.168.8.226',
+    'port': 6379,
+    'password': '0ef1sJm19w3OKHiH',
+    'decode_responses': True
+}
 
-    # If environment not specified in args, check environment variables
-    if not args.env:
-        env = os.environ.get('ENVIRONMENT', 'dev').lower()
-        if env in ['dev', 'prod']:
-            args.env = env
-
-    return args
-
-
-def get_postgres_config(env):
-    """Return PostgreSQL configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            "host": "192.168.8.230",
-            "database": "TrongTestDB1",
-            "user": "postgres",
-            "password": "admin123."
-        }
-    else:  # prod
-        return {
-            "host": "192.168.11.83",
-            "database": "ActivityDB",
-            "user": "vmladmin",
-            "password": "5d6v6hiFGGns4onnZGW0VfKe"
-        }
+# Redis configuration
+REDIS_PREFIX = "activity-dev:profile:"  # Prefix for profile data keys
+REDIS_INDEX = "activity-profile-idx"  # Index name, must match initProfileCache.py
 
 
-def get_redis_config(env):
-    """Return Redis configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            'host': '192.168.8.226',
-            'port': 6379,
-            'password': '0ef1sJm19w3OKHiH',
-            'decode_responses': True,
-            'index_name': 'activity-profile-idx',
-            'key_prefix': 'activity-dev:profile:'
-        }
-    else:  # prod
-        return {
-            'host': '192.168.11.84',
-            'port': 6379,
-            'password': 'oPn7NjDi569uCriqYbm9iCvR',
-            'decode_responses': True,
-            'index_name': 'activity-profile-idx',
-            'key_prefix': 'activity:profile:'
-        }
-
-
-def create_spark_session(env):
-    """Create and return a SparkSession with environment-specific configuration"""
-    app_name = f"ProfileRedisLoader-{env}"
-
+def create_spark_session():
+    """Create and return a SparkSession"""
     return SparkSession.builder \
-        .appName(app_name) \
+        .appName("ProfileRedisLoader") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
 
 
-def load_profiles_from_postgres(spark, env):
+def load_profiles_from_postgres(spark):
     """Load profiles from PostgreSQL using direct connection and convert to DataFrame"""
     import psycopg2
     from psycopg2.extras import RealDictCursor
 
-    postgres_config = get_postgres_config(env)
-    logger.info(f"Loading profiles from PostgreSQL ({env} environment)")
-    logger.info(f"PostgreSQL host: {postgres_config['host']}, database: {postgres_config['database']}")
-
     try:
         # Connect to PostgreSQL
         conn = psycopg2.connect(
-            host=postgres_config["host"],
-            database=postgres_config["database"],
-            user=postgres_config["user"],
-            password=postgres_config["password"]
+            host=POSTGRES_CONFIG["host"],
+            database=POSTGRES_CONFIG["database"],
+            user=POSTGRES_CONFIG["user"],
+            password=POSTGRES_CONFIG["password"]
         )
 
         # Query profiles
@@ -174,7 +129,6 @@ def load_profiles_from_postgres(spark, env):
             StructField("Phone", StringType(), True),
             StructField("Level", IntegerType(), True),
             StructField("TotalPoints", IntegerType(), True),
-            StructField("Rank", IntegerType(), True),
             StructField("LastModified", TimestampType(), True)
         ])
         empty_df = spark.createDataFrame([], schema)
@@ -230,17 +184,18 @@ def process_profiles(profiles_df):
     return processed_df
 
 
-def save_to_redis(df, env, batch_size=50):
-    """Save dataframe to Redis - running on driver for simplicity"""
+def save_to_redis(df, batch_size=50):
+    """Save dataframe to Redis - running on driver for simplicity
+
+    Given the error we've seen with distributed execution, this function
+    now runs on the driver to avoid potential issues with Redis libraries
+    or network connectivity from worker nodes.
+    """
     from redis import Redis
     import json
 
-    # Get Redis configuration for the environment
-    redis_config = get_redis_config(env)
-
     # Log the function execution
-    logger.info(f"Starting save_to_redis with {df.count()} records to Redis ({env} environment)")
-    logger.info(f"Redis host: {redis_config['host']}, port: {redis_config['port']}")
+    logger.info(f"Starting save_to_redis with {df.count()} records")
 
     # First collect data to driver
     rows = df.collect()
@@ -251,10 +206,10 @@ def save_to_redis(df, env, batch_size=50):
     try:
         # Create Redis connection
         redis_client = Redis(
-            host=redis_config['host'],
-            port=redis_config['port'],
-            password=redis_config['password'],
-            decode_responses=redis_config['decode_responses']
+            host=REDIS_CONFIG['host'],
+            port=REDIS_CONFIG['port'],
+            password=REDIS_CONFIG['password'],
+            decode_responses=REDIS_CONFIG['decode_responses']
         )
 
         # Test connection
@@ -278,7 +233,7 @@ def save_to_redis(df, env, batch_size=50):
             for row in batch:
                 try:
                     # Generate Redis key
-                    redis_key = f"{redis_config['key_prefix']}{row['Phone']}"
+                    redis_key = f"{REDIS_PREFIX}{row['Phone']}"
 
                     # Create Redis document - matching schema exactly
                     profile_doc = {
@@ -292,7 +247,7 @@ def save_to_redis(df, env, batch_size=50):
                     # Add to pipeline
                     pipeline.delete(redis_key)
                     pipeline.json().set(redis_key, "$", profile_doc)
-                    pipeline.sadd(redis_config['index_name'], redis_key)
+                    pipeline.sadd(REDIS_INDEX, redis_key)
                     success_count += 1
 
                 except Exception as e:
@@ -325,23 +280,22 @@ def save_to_redis(df, env, batch_size=50):
 
 def main():
     """Main entry point for the Spark application"""
-    # Parse arguments to get month, year, and environment
-    args = parse_arguments()
-    month = args.month
-    year = args.year
-    env = args.env
+    parser = argparse.ArgumentParser(description='Clone profiles from PostgreSQL to Redis')
+    parser.add_argument('--month', type=int, help='Month (for logging purposes)', default=datetime.now().month)
+    parser.add_argument('--year', type=int, help='Year (for logging purposes)', default=datetime.now().year)
+    args = parser.parse_args()
 
     spark = None
 
     try:
-        # Initialize Spark with environment-specific configuration
-        spark = create_spark_session(env)
+        # Initialize Spark
+        spark = create_spark_session()
 
         # Log app info
-        logger.info(f"Starting Profile to Redis Batch Process for {month}/{year} in {env} environment")
+        logger.info(f"Starting Profile to Redis Batch Process for {args.month}/{args.year}")
 
         # Load profiles from PostgreSQL
-        profiles_df = load_profiles_from_postgres(spark, env)
+        profiles_df = load_profiles_from_postgres(spark)
 
         if profiles_df.count() == 0:
             logger.warning("No profiles found in database")
@@ -354,8 +308,8 @@ def main():
         logger.info("Sample processed data:")
         processed_df.show(5, truncate=False)
 
-        # Save to Redis with environment-specific configuration
-        total_rows, success_count, error_count = save_to_redis(processed_df, env)
+        # Save to Redis
+        total_rows, success_count, error_count = save_to_redis(processed_df)
 
         # Log summary
         logger.info(f"Profile to Redis Batch Process completed")

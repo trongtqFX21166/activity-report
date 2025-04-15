@@ -4,101 +4,28 @@ from pyspark.sql import SparkSession
 from pymongo import MongoClient, UpdateOne, ASCENDING
 from pymongo.errors import CollectionInvalid, BulkWriteError
 import os
-import sys
 from datetime import datetime
 
 os.environ[
     'PYSPARK_SUBMIT_ARGS'] = '--packages io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-streaming_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:3.0.1 pyspark-shell'
 
 
-def get_environment():
-    """
-    Determine the execution environment (dev or prod).
-    Can be specified as a command-line argument or environment variable.
-    Defaults to 'dev' if not specified.
-    """
-    # Check command line arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
-        return sys.argv[1].lower()
-
-    # Check environment variables
-    env = os.environ.get('ENVIRONMENT', 'dev').lower()
-    if env in ['dev', 'prod']:
-        return env
-
-    # Default to dev
-    return 'dev'
-
-
-def get_mongodb_config(env):
-    """Return MongoDB configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            'host': 'mongodb://192.168.10.97:27017',
-            'database': 'activity_membershiptransactionmonthly_dev'
-        }
-    else:  # prod
-        return {
-            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
-            'database': 'activity_membershiptransactionmonthly',
-            'auth_source': 'admin'
-        }
-
-
-def get_kafka_config(env):
-    """Return Kafka configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            'bootstrap.servers': '192.168.8.184:9092',
-            'sasl.jaas.config': 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="Vietmap2021!@#";',
-            'security.protocol': 'SASL_PLAINTEXT',
-            'sasl.mechanism': 'PLAIN'
-        }
-    else:  # prod
-        return {
-            'bootstrap.servers': '192.168.11.201:9092,192.168.11.202:9092,192.168.11.203:9092',
-            'sasl.jaas.config': 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="3z740GCxK5xWfqoqKwxj";',
-            'security.protocol': 'SASL_PLAINTEXT',
-            'sasl.mechanism': 'PLAIN'
-        }
-
-
-def create_spark_session(app_name, env):
-    """Create Spark session with environment-specific MongoDB configurations"""
-    mongo_config = get_mongodb_config(env)
-
-    builder = SparkSession.builder \
-        .appName(f"{app_name}-{env}") \
+def create_spark_session(app_name):
+    return SparkSession.builder \
+        .appName(app_name) \
         .config("hive.metastore.uris", "thrift://192.168.10.167:9083") \
         .config("spark.sql.warehouse.dir", "/users/hive/warehouse") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
-
-    # Add MongoDB configuration
-    builder = builder \
-        .config("spark.mongodb.input.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.output.uri", f"{mongo_config['host']}/{mongo_config['database']}")
-
-    if 'auth_source' in mongo_config:
-        builder = builder \
-            .config("spark.mongodb.input.uri.authSource", mongo_config['auth_source']) \
-            .config("spark.mongodb.output.uri.authSource", mongo_config['auth_source'])
-
-    return builder.enableHiveSupport().getOrCreate()
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+        .config("spark.mongodb.input.uri", "mongodb://192.168.10.97:27017/activity_membershiptransactionmonthly_dev") \
+        .config("spark.mongodb.output.uri", "mongodb://192.168.10.97:27017/activity_membershiptransactionmonthly_dev") \
+        .enableHiveSupport() \
+        .getOrCreate()
 
 
-def get_mongodb_client(env):
-    """Create and return MongoDB client based on environment"""
-    mongo_config = get_mongodb_config(env)
-
-    # Create MongoDB client with appropriate settings
-    if env == 'dev':
-        return MongoClient(mongo_config['host'])
-    else:  # prod
-        return MongoClient(
-            mongo_config['host'],
-            authSource=mongo_config['auth_source']
-        )
+def get_mongodb_client():
+    """Create and return MongoDB client"""
+    return MongoClient('mongodb://192.168.10.97:27017/')
 
 
 def ensure_collection_exists(db, collection_name):
@@ -144,14 +71,12 @@ def ensure_collection_exists(db, collection_name):
     return collection
 
 
-def process_monthly_points(batch_df, batch_id, env):
+def process_monthly_points(batch_df, batch_id):
     """Process each batch and update monthly points in MongoDB"""
     if batch_df.isEmpty():
         return
 
     try:
-        print(f"Processing batch {batch_id} in {env.upper()} environment")
-
         # Filter for AddPoint transactions only
         points_df = batch_df.filter(col("name") == "AddPoint")
 
@@ -168,9 +93,8 @@ def process_monthly_points(batch_df, batch_id, env):
             return
 
         # Initialize MongoDB client
-        client = get_mongodb_client(env)
-        mongo_config = get_mongodb_config(env)
-        db = client[mongo_config['database']]
+        client = get_mongodb_client()
+        db = client['activity_membershiptransactionmonthly_dev']
 
         # Group updates by collection (year_month)
         updates_by_collection = {}
@@ -247,21 +171,17 @@ def process_monthly_points(batch_df, batch_id, env):
     except Exception as e:
         print(f"Error processing batch {batch_id}: {str(e)}")
         raise
-    finally:
-        if 'client' in locals():
-            client.close()
 
 
 def main():
-    # Determine environment
-    env = get_environment()
-    print(f"Starting monthly point updates processing in {env.upper()} environment")
+    print("Starting monthly point updates processing")
 
-    # Get Kafka configuration for the environment
-    kafka_config = get_kafka_config(env)
+    env = "dev"
+    kafka_host_prod = "192.168.10.221:9093,192.168.10.222:9093,192.168.10.223:9093,192.168.10.171:9093"
+    kafka_host_dev = "192.168.8.184:9092"
 
     # Initialize Spark Session
-    spark = create_spark_session("monthly point updater", env)
+    spark = create_spark_session("monthly point updater")
 
     # Define schema based on VML_ActivityTransaction message
     schema = ArrayType(StructType([
@@ -287,13 +207,13 @@ def main():
 
     # Configure Kafka connection
     kafka_options = {
-        "kafka.bootstrap.servers": kafka_config["bootstrap.servers"],
-        "kafka.sasl.jaas.config": kafka_config["sasl.jaas.config"],
-        "kafka.security.protocol": kafka_config["security.protocol"],
-        "kafka.sasl.mechanism": kafka_config["sasl.mechanism"],
+        "kafka.bootstrap.servers": kafka_host_prod if env == "prod" else kafka_host_dev,
+        "kafka.sasl.jaas.config": 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="Vietmap2021!@#";',
+        "kafka.security.protocol": "SASL_PLAINTEXT",
+        "kafka.sasl.mechanism": "PLAIN",
         "subscribe": "VML_ActivityTransaction",
         "startingOffsets": "earliest",
-        "kafka.group.id": f"monthly-membership-point-updater-mongodb-{env}",
+        "kafka.group.id": "monthly-membership-point-updater-mongodb",
         "failOnDataLoss": "false",
         "maxOffsetsPerTrigger": "1000"
     }
@@ -323,18 +243,11 @@ def main():
     for column in trans_stream_df.columns:
         trans_stream_df = trans_stream_df.withColumnRenamed(column, column.lower())
 
-    # Customize process_batch function to include environment
-    def process_batch_with_env(batch_df, batch_id):
-        return process_monthly_points(batch_df, batch_id, env)
-
-    # Environment-specific checkpoint location
-    checkpoint_location = f"/activity_{env}/chk-point-dir/monthly-point-updater-mongodb"
-
     # Start streaming process
     streaming_query = trans_stream_df.writeStream \
         .outputMode("append") \
-        .foreachBatch(process_batch_with_env) \
-        .option("checkpointLocation", checkpoint_location) \
+        .foreachBatch(process_monthly_points) \
+        .option("checkpointLocation", "/activity_dev/chk-point-dir/monthly-point-updater-mongodb") \
         .trigger(processingTime='1 seconds') \
         .start()
 

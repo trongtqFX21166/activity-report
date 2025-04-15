@@ -9,7 +9,6 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import logging
 import os
-import sys
 
 # Configure logging
 logging.basicConfig(
@@ -17,6 +16,23 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("ProfileLevelUpgrader")
+
+# Configuration
+POSTGRES_CONFIG = {
+    "host": "192.168.8.230",
+    "database": "TrongTestDB1",
+    "user": "postgres",
+    "password": "admin123."
+}
+
+KAFKA_CONFIG = {
+    "bootstrap.servers": "192.168.8.184:9092",
+    "sasl.mechanism": "PLAIN",
+    "security.protocol": "SASL_PLAINTEXT",
+    "sasl.jaas.config": 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="Vietmap2021!@#";'
+}
+
+KAFKA_TOPIC = "VML_ActivityTransaction"
 
 # Time window for profile updates (in minutes)
 PROFILE_UPDATE_WINDOW_MINUTES = 30
@@ -42,93 +58,25 @@ def calculate_level_thresholds(max_level=100):
 # Define level thresholds (calculated up to level 100, but can be extended)
 LEVEL_THRESHOLDS = calculate_level_thresholds(100)
 
-
-# Environment functions
-def get_environment():
-    """
-    Determine the execution environment (dev or prod).
-    Can be specified as a command-line argument or environment variable.
-    Defaults to 'dev' if not specified.
-    """
-    # Check command line arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
-        return sys.argv[1].lower()
-
-    # Check environment variables
-    env = os.environ.get('ENVIRONMENT', 'dev').lower()
-    if env in ['dev', 'prod']:
-        return env
-
-    # Default to dev
-    return 'dev'
-
-
-def get_postgres_config(env):
-    """Return PostgreSQL configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            "host": "192.168.8.230",
-            "database": "TrongTestDB1",
-            "user": "postgres",
-            "password": "admin123."
-        }
-    else:  # prod
-        return {
-            "host": "192.168.11.83",
-            "database": "ActivityDB",
-            "user": "vmladmin",
-            "password": "5d6v6hiFGGns4onnZGW0VfKe"
-        }
-
-
-def get_kafka_config(env):
-    """Return Kafka configuration for the specified environment"""
-    if env == 'dev':
-        return {
-            "bootstrap.servers": "192.168.8.184:9092",
-            "sasl.mechanism": "PLAIN",
-            "security.protocol": "SASL_PLAINTEXT",
-            "sasl.jaas.config": 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="Vietmap2021!@#";'
-        }
-    else:  # prod
-        return {
-            "bootstrap.servers": "192.168.11.201:9092,192.168.11.202:9092,192.168.11.203:9092",
-            "sasl.mechanism": "PLAIN",
-            "security.protocol": "SASL_PLAINTEXT",
-            "sasl.jaas.config": 'org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="3z740GCxK5xWfqoqKwxj";'
-        }
-
-
-def get_kafka_topic(env):
-    """Return appropriate Kafka topic based on environment"""
-    if env == 'dev':
-        return "VML_ActivityTransaction"
-    else:  # prod
-        return "VML_ActivityTransaction"  # Adjust if different in production
-
-
 # Print the first few levels and their thresholds for logging
 logger.info("Level threshold calculation:")
 for level in range(1, 11):
     logger.info(f"Level {level}: {LEVEL_THRESHOLDS[level]} points")
 
 
-def create_spark_session(env):
+def create_spark_session():
     """Create a Spark session"""
-    app_name = f"ProfileLevelUpgrader-{env}"
-
     return SparkSession.builder \
-        .appName(app_name) \
+        .appName("ProfileLevelUpgrader") \
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .getOrCreate()
 
 
-def get_postgres_connection(env):
+def get_postgres_connection():
     """Create a connection to PostgreSQL database"""
     try:
-        config = get_postgres_config(env)
-        conn = psycopg2.connect(**config)
+        conn = psycopg2.connect(**POSTGRES_CONFIG)
         return conn
     except Exception as e:
         logger.error(f"Error connecting to PostgreSQL: {str(e)}")
@@ -227,17 +175,13 @@ def update_profile_level(conn, profile_id, new_level):
         return False
 
 
-def send_kafka_messages(spark, messages, env):
+def send_kafka_messages(spark, messages):
     """Send messages to Kafka using Spark's Kafka producer"""
     if not messages:
         logger.info("No messages to send to Kafka")
         return
 
-    # Get Kafka configuration for the environment
-    kafka_config = get_kafka_config(env)
-    kafka_topic = get_kafka_topic(env)
-
-    logger.info(f"Sending {len(messages)} messages to Kafka topic {kafka_topic} in {env} environment")
+    logger.info(f"Sending {len(messages)} messages to Kafka topic {KAFKA_TOPIC}")
 
     # Convert messages to DataFrame
     messages_schema = StructType([
@@ -254,25 +198,25 @@ def send_kafka_messages(spark, messages, env):
     # Send to Kafka
     messages_df.write \
         .format("kafka") \
-        .option("kafka.bootstrap.servers", kafka_config["bootstrap.servers"]) \
-        .option("topic", kafka_topic) \
-        .option("kafka.sasl.mechanism", kafka_config["sasl.mechanism"]) \
-        .option("kafka.security.protocol", kafka_config["security.protocol"]) \
-        .option("kafka.sasl.jaas.config", kafka_config["sasl.jaas.config"]) \
+        .option("kafka.bootstrap.servers", KAFKA_CONFIG["bootstrap.servers"]) \
+        .option("topic", KAFKA_TOPIC) \
+        .option("kafka.sasl.mechanism", KAFKA_CONFIG["sasl.mechanism"]) \
+        .option("kafka.security.protocol", KAFKA_CONFIG["security.protocol"]) \
+        .option("kafka.sasl.jaas.config", KAFKA_CONFIG["sasl.jaas.config"]) \
         .save()
 
     logger.info(f"Successfully sent {len(messages)} messages to Kafka")
 
 
-def process_profiles(env):
+def process_profiles():
     """Main function to process all profiles"""
     conn = None
     spark = None
 
     try:
         # Setup connections
-        conn = get_postgres_connection(env)
-        spark = create_spark_session(env)
+        conn = get_postgres_connection()
+        spark = create_spark_session()
 
         # Get current date/time info
         dt_info = get_current_datetime_epoch()
@@ -290,29 +234,25 @@ def process_profiles(env):
         kafka_messages = []
 
         for profile in profiles:
-            try:
-                total_points = profile["TotalPoints"] or 0  # Use 0 if None
-                current_level = profile["Level"] or 1  # Use 1 if None
+            total_points = profile["TotalPoints"]
+            current_level = profile["Level"]
 
-                # Determine the correct level based on points
-                new_level = determine_level(total_points)
+            # Determine the correct level based on points
+            new_level = determine_level(total_points)
 
-                # Check if level has changed
-                if new_level != current_level:
-                    logger.info(
-                        f"Profile {profile['Phone']} needs level upgrade: {current_level} → {new_level} "
-                        f"(Points: {total_points}, MembershipCode: {profile['MembershipCode']})"
-                    )
+            # Check if level has changed
+            if new_level != current_level:
+                logger.info(
+                    f"Profile {profile['Phone']} needs level upgrade: {current_level} → {new_level} "
+                    f"(Points: {total_points}, MembershipCode: {profile['MembershipCode']})"
+                )
 
-                    # Update profile in database - only update the level, keep the existing membership code
-                    if update_profile_level(conn, profile["Id"], new_level):
-                        # Create Kafka message
-                        message = create_level_upgrade_message(profile, new_level, dt_info)
-                        kafka_messages.append(message)
-                        total_updated += 1
-            except Exception as e:
-                logger.error(f"Error processing profile {profile.get('Phone', 'unknown')}: {str(e)}")
-                continue
+                # Update profile in database - only update the level, keep the existing membership code
+                if update_profile_level(conn, profile["Id"], new_level):
+                    # Create Kafka message
+                    message = create_level_upgrade_message(profile, new_level, dt_info)
+                    kafka_messages.append(message)
+                    total_updated += 1
 
             total_processed += 1
 
@@ -322,7 +262,7 @@ def process_profiles(env):
 
         # Send kafka messages in batch
         if kafka_messages:
-            send_kafka_messages(spark, kafka_messages, env)
+            send_kafka_messages(spark, kafka_messages)
 
         logger.info(f"Processing complete. Total profiles: {len(profiles)}, Updated: {total_updated}")
 
@@ -338,17 +278,14 @@ def process_profiles(env):
 
 def main():
     """Main entry point"""
-    # Determine environment
-    env = get_environment()
-    logger.info(
-        f"Starting Profile Level Upgrade Batch Process in {env.upper()} environment (window: {PROFILE_UPDATE_WINDOW_MINUTES} minutes)")
+    logger.info(f"Starting Profile Level Upgrade Batch Process (window: {PROFILE_UPDATE_WINDOW_MINUTES} minutes)")
 
     try:
         # Process the profiles
-        process_profiles(env)
-        logger.info(f"Profile Level Upgrade Batch Process completed successfully in {env.upper()} environment")
+        process_profiles()
+        logger.info("Profile Level Upgrade Batch Process completed successfully")
     except Exception as e:
-        logger.error(f"Profile Level Upgrade Batch Process failed in {env.upper()} environment: {str(e)}")
+        logger.error(f"Profile Level Upgrade Batch Process failed: {str(e)}")
         raise
 
 
