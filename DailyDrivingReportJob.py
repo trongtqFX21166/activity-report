@@ -126,10 +126,7 @@ def create_spark_session(app_name, env):
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
         .config("hive.metastore.uris", "thrift://192.168.10.167:9083") \
         .config("spark.sql.warehouse.dir", "/users/hive/warehouse") \
-        .config("spark.driver.extraClassPath",
-                "/opt/conda/lib/python3.8/site-packages/pyspark/jars/kafka-clients-3.3.1.jar") \
-        .config("spark.executor.extraClassPath",
-                "/opt/conda/lib/python3.8/site-packages/pyspark/jars/kafka-clients-3.3.1.jar") \
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2") \
         .config("spark.executor.memory", "4g") \
         .config("spark.driver.memory", "4g") \
         .config("spark.dynamicAllocation.enabled", "false") \
@@ -430,11 +427,11 @@ def load_device_mapping(spark, reports_df, env):
         batch_size = 50  # Reduced batch size
         total_devices = len(device_rows)
 
-        # Debug limit - use the smaller of 10 or total_devices
-        debug_limit = 10 if total_devices > 10 else total_devices
+        # Debug limit - use the smaller of 50 or total_devices
+        debug_limit = 50 if total_devices > 50 else total_devices  # Use direct comparison instead of min()
 
         logger.info(f"Processing {total_devices} VML devices in batches of {batch_size}")
-        logger.info(f"DEBUGGING MODE: Only processing the first {debug_limit} devices")
+        logger.info(f"Processing the first {debug_limit} devices")
 
         # Process in batches, but limit to debug_limit devices for debugging
         for i in range(0, debug_limit, batch_size):
@@ -446,7 +443,7 @@ def load_device_mapping(spark, reports_df, env):
             batch = device_rows[i:end_idx]
             batch_size_actual = len(batch)
 
-            # Calculate total batches without using min()
+            # Calculate total batches
             total_batches = (debug_limit + batch_size - 1) // batch_size
             current_batch = i // batch_size + 1
 
@@ -484,8 +481,8 @@ def load_device_mapping(spark, reports_df, env):
 
             # Show sample if available
             if mapping_count > 0:
-                # Calculate sample count without using min()
-                sample_count = 5 if mapping_count > 5 else mapping_count
+                # Calculate sample count
+                sample_count = 5
                 logger.info(f"Sample of device-phone mappings (showing {sample_count} records):")
                 device_mapping.limit(sample_count).show(truncate=False)
 
@@ -552,7 +549,6 @@ def prepare_kafka_events(reports_df, device_mapping):
             return None
 
         # Take a small sample to verify join worked
-        # Calculate sample size without using min()
         sample_size = 3 if filtered_count > 3 else filtered_count
         sample_filtered = filtered_df.limit(sample_size)
         logger.info("Sample joined data:")
@@ -562,9 +558,9 @@ def prepare_kafka_events(reports_df, device_mapping):
         uuid_udf = udf(lambda: str(uuid.uuid4()), StringType())
 
         # Function to convert distance from m to km and round
-        # FIX: Properly handle the float result by converting it to a string directly in the UDF
+        # Fix: Use simpler logic that doesn't rely on direct round() function
         meters_to_km_udf = udf(
-            lambda meters: str(int(round(float(meters) / 1000))) if meters is not None else "0",
+            lambda meters: str(int(float(meters) / 1000)) if meters is not None else "0",
             StringType()
         )
 
@@ -585,12 +581,11 @@ def prepare_kafka_events(reports_df, device_mapping):
 
         # Log conversion example
         logger.info("Distance conversion example (m to km):")
-        # FIX: Use lit() here to properly wrap values in column objects
         filtered_df.select(
             col("deviceimei"),
             col("phone"),
             col("distance").alias("distance_meters"),
-            (col("distance") / lit(1000)).cast("float").alias("distance_km")
+            lit(col("distance") / 1000).cast("float").alias("distance_km")
         ).limit(5).show()
 
         # Count final events
@@ -607,164 +602,55 @@ def prepare_kafka_events(reports_df, device_mapping):
 
 
 def send_to_kafka(events_df, env):
-    """Send events to Kafka in batches of 500"""
+    """Send events to Kafka using Spark's built-in Kafka integration"""
     if events_df is None or events_df.isEmpty():
         logger.warning("No events to send to Kafka")
         return 0
 
-    kafka_config = get_kafka_config(env)
-    logger.info(f"Kafka configuration: {kafka_config['bootstrap.servers']}, Topic: {kafka_config['topic']}")
-
-    # Take a small sample to verify event format
-    sample_events = events_df.limit(1)
     try:
-        sample_count = sample_events.count()  # Small count, minimal performance impact
-    except Exception as e:
-        logger.error(f"Error counting sample events: {str(e)}")
-        sample_count = 0
+        # Get Kafka configuration
+        kafka_config = get_kafka_config(env)
+        logger.info(f"Sending events to Kafka topic: {kafka_config['topic']}")
 
-    if sample_count == 0:
-        logger.warning("No events to send to Kafka (empty dataset)")
-        return 0
+        # Package events into the proper format for Kafka
+        # Convert to array format first (wrapped in []) as expected by VML_ActivityEvent topic
+        events_json_df = events_df.select(
+            to_json(
+                array(
+                    struct(
+                        col("Id"), col("Phone"), col("Date"), col("Month"), col("Year"),
+                        col("TimeStamp"), col("MembershipCode"), col("Event"), col("ReportCode"),
+                        col("EventName"), col("ReportName"), col("Data")
+                    )
+                )
+            ).alias("value")
+        )
 
-    logger.info(f"Preparing to send events to Kafka topic {kafka_config['topic']}")
-
-    # Convert events to the expected JSON format for Kafka
-    events_json_df = events_df.select(
-        to_json(struct(
-            col("Id"), col("Phone"), col("Date"), col("Month"), col("Year"),
-            col("TimeStamp"), col("MembershipCode"), col("Event"), col("ReportCode"),
-            col("EventName"), col("ReportName"), col("Data")
-        )).alias("value")
-    )
-
-    # Show a sample of the JSON format - wrap in try-except to avoid failures
-    try:
+        # Show sample of the JSON format
         logger.info("Sample JSON event format:")
         events_json_df.limit(1).show(truncate=False)
-    except Exception as e:
-        logger.warning(f"Failed to show sample JSON event: {str(e)}")
 
-    try:
-        # FIX: Use the full import path for KafkaProducer
-        try:
-            # Try importing from kafka package first
-            import kafka
-            logger.info(f"Kafka package version: {kafka.__version__}")
+        # Configure Kafka producer options
+        kafka_options = {
+            "kafka.bootstrap.servers": kafka_config["bootstrap.servers"],
+            "kafka.sasl.jaas.config": kafka_config["sasl.jaas.config"],
+            "kafka.security.protocol": kafka_config["security.protocol"],
+            "kafka.sasl.mechanism": kafka_config["sasl.mechanism"],
+            "topic": kafka_config["topic"]
+        }
 
-            # Try direct import from kafka.producer first
-            try:
-                from kafka.producer import KafkaProducer
-                logger.info("Successfully imported KafkaProducer from kafka.producer")
-            except ImportError:
-                # Fall back to install kafka-python explicitly
-                logger.warning("Cannot import KafkaProducer. Installing kafka-python...")
-                import subprocess
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", "--force-reinstall", "kafka-python==2.0.2"])
-                # Try the import again
-                from kafka.producer import KafkaProducer
-                logger.info("Successfully imported KafkaProducer after reinstall")
-        except ImportError as e:
-            logger.warning(f"Kafka Python client not available. Installing... Error: {str(e)}")
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "kafka-python==2.0.2"])
-            from kafka.producer import KafkaProducer
+        # Write to Kafka using Spark's built-in writer
+        events_json_df.write \
+            .format("kafka") \
+            .options(**kafka_options) \
+            .save()
 
-        # Collect data to driver - this is safe as we're only working with batches
-        event_messages = events_json_df.collect()
-        total_events = len(event_messages)
-        batch_size = 500
+        # Get count of events sent
+        events_count = events_json_df.count()
+        logger.info(f"Successfully sent {events_count} events to Kafka topic {kafka_config['topic']}")
 
-        logger.info(f"Processing {total_events} events in batches of {batch_size}")
+        return events_count
 
-        # Process in batches
-        total_sent = 0
-        for i in range(0, total_events, batch_size):
-            # Calculate end index without using min()
-            end_idx = i + batch_size
-            if end_idx > total_events:
-                end_idx = total_events
-
-            batch = event_messages[i:end_idx]
-            batch_size_actual = len(batch)
-
-            # Calculate batch numbers without using min()
-            total_batches = (total_events + batch_size - 1) // batch_size
-            current_batch = i // batch_size + 1
-
-            logger.info(
-                f"Processing batch {current_batch} of {total_batches} ({batch_size_actual} events)")
-
-            # Send this batch using Kafka Python client
-            # Extract credentials from JAAS config string
-            jaas_config = kafka_config["sasl.jaas.config"]
-            username = "admin"  # Default
-            password = None
-
-            # Extract password from JAAS config
-            if "password=" in jaas_config:
-                try:
-                    password = jaas_config.split('password="')[1].split('";')[0]
-                except Exception as e:
-                    logger.error(f"Error parsing JAAS config: {str(e)}")
-                    password = None
-
-            if not password:
-                logger.error("Failed to extract password from JAAS config")
-                return 0
-
-            # Create producer with detailed logging
-            logger.info(f"Creating Kafka producer for {kafka_config['bootstrap.servers']}")
-
-            producer = None
-            try:
-                producer = KafkaProducer(
-                    bootstrap_servers=kafka_config["bootstrap.servers"].split(','),
-                    security_protocol=kafka_config["security.protocol"],
-                    sasl_mechanism=kafka_config["sasl.mechanism"],
-                    sasl_plain_username=username,
-                    sasl_plain_password=password
-                )
-                logger.info("Kafka producer created successfully")
-
-                # Process each message in the batch
-                batch_sent = 0
-                batch_errors = 0
-
-                for record in batch:
-                    try:
-                        # Send message to Kafka
-                        producer.send(
-                            kafka_config["topic"],
-                            value=record["value"].encode('utf-8')
-                        )
-                        batch_sent += 1
-                    except Exception as e:
-                        batch_errors += 1
-                        logger.error(f"Error sending message to Kafka: {str(e)}")
-
-                # Flush producer to ensure all messages are sent
-                producer.flush()
-                logger.info(f"Producer flushed successfully")
-
-                total_sent += batch_sent
-
-                logger.info(f"Batch {current_batch} complete: Sent {batch_sent} events, {batch_errors} errors")
-
-            except Exception as e:
-                logger.error(f"Error creating or using Kafka producer: {str(e)}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                return total_sent
-            finally:
-                # Close the producer
-                if producer:
-                    producer.close()
-                    logger.info("Kafka producer closed")
-
-        logger.info(f"Successfully sent {total_sent} events to Kafka topic {kafka_config['topic']}")
-        return total_sent
     except Exception as e:
         logger.error(f"Error sending events to Kafka: {str(e)}")
         import traceback
