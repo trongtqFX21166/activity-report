@@ -23,7 +23,6 @@ import time
 from datetime import datetime, timedelta
 import logging
 import os
-from redis import Redis
 import sys
 
 # Configure logging
@@ -100,14 +99,16 @@ def get_redis_config(env):
     """Return Redis configuration for the specified environment"""
     if env == 'dev':
         return {
-            'hosts': '192.168.8.180,192.168.8.181,192.168.8.182',
+            'hosts': ['192.168.8.180', '192.168.8.181', '192.168.8.182', '192.168.8.172'],  # Include all known nodes
+            'port': 6379,
             'password': 'CDp4VrUuy744Ur2fGd5uakRsWe4Pu3P8',
             'prefix_key': 'vml',
             'decode_responses': True
         }
     else:  # prod
         return {
-            'hosts': '192.168.11.180,192.168.11.181,192.168.11.182',
+            'hosts': ['192.168.11.180', '192.168.11.181', '192.168.11.182'],  # Update with all prod nodes
+            'port': 6379,
             'password': 'CDp4VrUuy744Ur2fGd5uakRsWe4Pu3P8',  # Use the same password or update for prod
             'prefix_key': 'vml',  # Assuming different prefix for prod
             'decode_responses': True
@@ -149,43 +150,87 @@ def get_user_info_from_redis(device_id, env):
     Returns:
         Dict containing user information or None if not found
     """
+    # Import locally to ensure it's available on executor nodes
     from redis import Redis
     import json
 
     redis_config = get_redis_config(env)
+    redis_client = None
 
     try:
-        # Parse hosts
-        hosts = redis_config['hosts'].split(',')
-        host = hosts[0]  # Use the first host from the list
+        # Try each Redis host until we find one that works
+        last_error = None
+        for host in redis_config['hosts']:
+            try:
+                # Connect to a single Redis node
+                redis_client = Redis(
+                    host=host,
+                    port=redis_config['port'],
+                    password=redis_config['password'],
+                    decode_responses=redis_config['decode_responses'],
+                    socket_timeout=5.0  # Set a reasonable timeout
+                )
 
-        # Connect to Redis
-        redis_client = Redis(
-            host=host,
-            port=6379,  # Default port
-            password=redis_config['password'],
-            decode_responses=redis_config['decode_responses']
-        )
+                # Test connection
+                redis_client.ping()
 
-        # Get device information
-        prefix = redis_config['prefix_key']
-        device_key = f"{prefix}:data:User:{device_id}"
-        device_info_str = redis_client.get(device_key)
+                # Get device information
+                prefix = redis_config['prefix_key']
+                device_key = f"{prefix}:data:User:{device_id}"
 
-        if not device_info_str:
-            logger.warning(f"No user information found in Redis for user ID: {device_id} (key: {user_key})")
-            return None
+                # Log the key we're looking up for debugging
+                logger.debug(f"Looking up Redis key: {device_key} on host {host}")
 
-        # Parse user information
-        user_info = json.loads(device_info_str)
+                device_info_str = redis_client.get(device_key)
 
-        return user_info
-    except Exception as e:
-        logger.error(f"Error getting user information from Redis: {str(e)}")
+                # If we get a MOVED error (not directly catchable), it will raise an exception
+                # and we'll try the next host
+
+                if device_info_str:
+                    # Parse user information
+                    user_info = json.loads(device_info_str)
+                    logger.debug(f"Successfully retrieved user info from host {host}")
+                    return user_info
+                else:
+                    # Key not found on this host, try next one
+                    logger.debug(f"Key not found on host {host}, trying next host if available")
+
+                # Close this connection before trying the next host
+                redis_client.close()
+                redis_client = None
+
+            except Exception as e:
+                last_error = e
+                logger.debug(f"Error connecting to Redis host {host}: {str(e)}")
+
+                # If this is a MOVED error, we could parse the target host from the error message
+                # But for simplicity, we'll just try all hosts in the list
+
+                if redis_client:
+                    try:
+                        redis_client.close()
+                    except:
+                        pass
+                    redis_client = None
+
+        # If we got here, we tried all hosts and didn't find the key
+        if last_error:
+            logger.warning(f"Could not retrieve data for device {device_id} from any Redis host: {str(last_error)}")
+        else:
+            logger.debug(f"No user information found in Redis for device ID: {device_id}")
         return None
+
+    except Exception as e:
+        logger.error(f"Unexpected error getting user information from Redis for device ID {device_id}: {str(e)}")
+        return None
+
     finally:
-        if 'redis_client' in locals():
-            redis_client.close()
+        if redis_client:
+            # Close the Redis connection
+            try:
+                redis_client.close()
+            except:
+                pass
 
 
 def extract_device_id(imei):
@@ -216,7 +261,7 @@ def read_all_daily_reports(spark, process_date, env):
             .format("org.apache.spark.sql.cassandra") \
             .options(table=cassandra_config['table'], keyspace=cassandra_config['keyspace']) \
             .load() \
-            .filter(col("date") == date_timestamp)
+            .filter((col("date") == date_timestamp) & (col("distance") >= 1000))
 
         # Cache the dataframe since we'll be using it multiple times
         summary_df.cache()
@@ -272,7 +317,7 @@ def load_device_mapping(spark, reports_df, env):
             .select("deviceimei", "device_id") \
             .filter(col("device_id").isNotNull())
 
-        # Process in batches of 500
+        # Process in batches of 50 (reduced from 500 to avoid timeouts)
         # First collect to driver - this is safe because we're just working with the distinct IMEIs
         device_rows = device_ids_df.collect()
 
@@ -284,37 +329,51 @@ def load_device_mapping(spark, reports_df, env):
 
         # Initialize empty result
         result_rows = []
-        batch_size = 500
-        total_devices = len(device_rows)
+        batch_size = 50  # Reduced batch size
+        total_devices = 100
 
         logger.info(f"Processing {total_devices} VML devices in batches of {batch_size}")
+        logger.info(f"DEBUGGING MODE: Only processing the first 10 devices")
 
-        # Process in batches
+        # Process in batches, but only the first 10 devices for debugging
         for i in range(0, total_devices, batch_size):
+
             batch = device_rows[i:i + batch_size]
+            batch_size_actual = len(batch)
             logger.info(
-                f"Processing batch {i // batch_size + 1} of {(total_devices + batch_size - 1) // batch_size} ({len(batch)} devices)")
+                f"Processing batch {i // batch_size + 1} of {(total_devices + batch_size - 1) // batch_size} ({batch_size_actual} devices)")
 
             # Process each device in the batch
+            successful_lookups = 0
             for row in batch:
                 device_imei = row["deviceimei"]
                 device_id = row["device_id"]
+
+                # Add some debug info
+                logger.debug(f"Looking up device ID: {device_id} (from IMEI: {device_imei})")
 
                 user_info = get_user_info_from_redis(device_id, env)
 
                 if user_info and "Phone" in user_info:
                     result_rows.append((device_imei, user_info["Phone"]))
+                    successful_lookups += 1
 
             # Log progress
-            logger.info(f"Completed batch {i // batch_size + 1}, total mapped so far: {len(result_rows)}")
+            logger.info(
+                f"Completed batch {i // batch_size + 1}: {successful_lookups}/{batch_size_actual} successful lookups")
+            logger.info(f"Total mapped so far: {len(result_rows)}/{min(10, total_devices)}")
 
-        # Create dataframe from results
+            # Add a small delay between batches to avoid overwhelming Redis
+            time.sleep(0.1)
+
+            # Create dataframe from results
         device_mapping = spark.createDataFrame(result_rows, schema).cache()
 
         # Take a small sample to verify data without counting
         sample_mapping = device_mapping.limit(5)
         sample_count = sample_mapping.count()  # This is a small count, so performance impact is minimal
 
+        logger.info(f"Device mapping complete: {len(result_rows)} devices successfully mapped (debug mode)")
         logger.info(f"Sample of device-phone mappings (showing {sample_count} records):")
         sample_mapping.show(truncate=False)
 
@@ -338,14 +397,29 @@ def prepare_kafka_events(reports_df, device_mapping):
         how="inner"
     )
 
+    # Filter for records with distance > 0
+    filtered_df = joined_df.filter(col("distance") > 0)
+
+    # Count filtered records
+    original_count = joined_df.count()
+    filtered_count = filtered_df.count()
+    logger.info(f"Filtered out {original_count - filtered_count} records with distance ≤ 0")
+    logger.info(f"Keeping {filtered_count} records with distance > 0")
+
     # Take a small sample to verify join worked without counting entire dataset
-    sample_joined = joined_df.limit(3)
-    sample_joined.show(truncate=False)
+    sample_filtered = filtered_df.limit(3)
+    sample_filtered.show(truncate=False)
 
     # Generate UUID for event ID
     uuid_udf = udf(lambda: str(uuid.uuid4()), StringType())
 
-    events_df = joined_df.select(
+    # Function to convert distance from m to km and round
+    meters_to_km_udf = udf(
+        lambda meters: str(round(float(meters) / 1000)) if meters is not None else "0",
+        StringType()
+    )
+
+    events_df = filtered_df.select(
         uuid_udf().alias("Id"),
         col("phone").alias("Phone"),
         col("date").alias("Date"),
@@ -357,15 +431,24 @@ def prepare_kafka_events(reports_df, device_mapping):
         lit("DrivingDaily").alias("ReportCode"),
         lit("Lái xe hàng ngày").alias("EventName"),
         lit("Lái xe hàng ngày").alias("ReportName"),
-        col("distance").cast("string").alias("Data")  # Convert distance to string for Data field
+        meters_to_km_udf(col("distance")).alias("Data")  # Convert distance from m to km and round
     )
+
+    # Log conversion example
+    logger.info("Distance conversion example (m to km):")
+    filtered_df.select(
+        col("deviceimei"),
+        col("phone"),
+        col("distance").alias("distance_meters"),
+        (col("distance") / 1000).cast("float").alias("distance_km")
+    ).limit(5).show()
 
     return events_df
 
 
 def send_to_kafka(events_df, env):
     """Send events to Kafka in batches of 500"""
-    if events_df is None:
+    if events_df is None or events_df.isEmpty():
         logger.warning("No events to send to Kafka")
         return 0
 
@@ -373,7 +456,11 @@ def send_to_kafka(events_df, env):
 
     # Take a small sample to verify event format
     sample_events = events_df.limit(1)
-    sample_count = sample_events.count()  # Small count, minimal performance impact
+    try:
+        sample_count = sample_events.count()  # Small count, minimal performance impact
+    except Exception as e:
+        logger.error(f"Error counting sample events: {str(e)}")
+        sample_count = 0
 
     if sample_count == 0:
         logger.warning("No events to send to Kafka (empty dataset)")
@@ -390,9 +477,12 @@ def send_to_kafka(events_df, env):
         )).alias("value")
     )
 
-    # Show a sample of the JSON format
-    logger.info("Sample JSON event format:")
-    events_json_df.limit(1).show(truncate=False)
+    # Show a sample of the JSON format - wrap in try-except to avoid failures
+    try:
+        logger.info("Sample JSON event format:")
+        events_json_df.limit(1).show(truncate=False)
+    except Exception as e:
+        logger.warning(f"Failed to show sample JSON event: {str(e)}")
 
     try:
         # Collect data to driver - this is safe as we're only working with batches
