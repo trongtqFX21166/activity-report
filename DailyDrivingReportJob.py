@@ -290,7 +290,7 @@ def read_daily_reports(spark, process_date, env):
                 .format("org.apache.spark.sql.cassandra") \
                 .options(table=cassandra_config['table'], keyspace=cassandra_config['keyspace']) \
                 .load() \
-                .filter(col("date") == date_timestamp)
+                .filter((col("date") == date_timestamp) & (col("distance") >= 1000))
 
             # Cache the dataframe since we'll be using it multiple times
             summary_df.cache()
@@ -612,16 +612,14 @@ def send_to_kafka(events_df, env):
         kafka_config = get_kafka_config(env)
         logger.info(f"Sending events to Kafka topic: {kafka_config['topic']}")
 
-        # Package events into the proper format for Kafka
-        # Convert to array format first (wrapped in []) as expected by VML_ActivityEvent topic
+        # MODIFIED: Package events individually instead of as an array
+        # Simply use to_json directly on the struct without wrapping in array()
         events_json_df = events_df.select(
             to_json(
-                array(
-                    struct(
-                        col("Id"), col("Phone"), col("Date"), col("Month"), col("Year"),
-                        col("TimeStamp"), col("MembershipCode"), col("Event"), col("ReportCode"),
-                        col("EventName"), col("ReportName"), col("Data")
-                    )
+                struct(
+                    col("Id"), col("Phone"), col("Date"), col("Month"), col("Year"),
+                    col("TimeStamp"), col("MembershipCode"), col("Event"), col("ReportCode"),
+                    col("EventName"), col("ReportName"), col("Data")
                 )
             ).alias("value")
         )
