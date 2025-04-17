@@ -10,6 +10,8 @@ from airflow.operators.bash import BashOperator
 from airflow.models import Variable
 import time
 
+ENVIRONMENT = "prod"
+
 default_args = {
     'owner': 'VM',
     'start_date': datetime(2025, 2, 20),
@@ -25,7 +27,7 @@ current_month = current_date.month
 current_year = current_date.year
 
 with DAG('Activity_Batch_Profile_Level_Frequency', default_args=default_args,
-         schedule="*/10 * * * *", catchup=False, dagrun_timeout=timedelta(minutes=10)) as dag:
+         schedule="*/15 * * * *", catchup=False, dagrun_timeout=timedelta(minutes=15)) as dag:
     # t1, t2 and t3 are examples of tasks created by instantiating operators
     begin_task = BashOperator(
         task_id="begin_task",
@@ -36,6 +38,7 @@ with DAG('Activity_Batch_Profile_Level_Frequency', default_args=default_args,
         task_id="Ranking_Profile_AllTime",
         conn_id="spark_default",
         application="hdfs://192.168.10.167:9000/app/RankingProfileAllTime.py",
+        application_args=[ENVIRONMENT],
         name="Ranking_Profile_Yearly",
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
         env_vars={
@@ -47,16 +50,17 @@ with DAG('Activity_Batch_Profile_Level_Frequency', default_args=default_args,
         conf={
             "spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"
         },
-        driver_memory="512m",
-        executor_memory="512m",
-        executor_cores="1",
-        num_executors="1"
+        driver_memory="1g",
+        executor_memory="1g",
+        executor_cores="4",
+        num_executors="2"
     )
 
     Update_Profile_Level = SparkSubmitOperator(
         task_id="Update_Profile_Level",
         conn_id="spark_default",
         application="hdfs://192.168.10.167:9000/app/UpdateProfileLevelInDurationTime.py",
+        application_args=[ENVIRONMENT],
         name="Update_Profile_Level",
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2",
         env_vars={
@@ -68,10 +72,10 @@ with DAG('Activity_Batch_Profile_Level_Frequency', default_args=default_args,
         conf={
             "spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"
         },
-        driver_memory="512m",
-        executor_memory="512m",
-        executor_cores="1",
-        num_executors="1"
+        driver_memory="1g",
+        executor_memory="1g",
+        executor_cores="4",
+        num_executors="2"
     )
 
     Load_Redis_Profile = SparkSubmitOperator(
@@ -81,7 +85,8 @@ with DAG('Activity_Batch_Profile_Level_Frequency', default_args=default_args,
         name="Load_Redis_Profile",
         application_args=[
             "--month", str(current_month),
-            "--year", str(current_year)
+            "--year", str(current_year),
+            "--env", str(ENVIRONMENT)
         ],
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
         env_vars={
@@ -93,10 +98,10 @@ with DAG('Activity_Batch_Profile_Level_Frequency', default_args=default_args,
         conf={
             "spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"
         },
-        driver_memory="512m",
-        executor_memory="512m",
-        executor_cores="1",
-        num_executors="1"
+        driver_memory="1g",
+        executor_memory="1g",
+        executor_cores="4",
+        num_executors="2"
     )
 
     end_task = BashOperator(

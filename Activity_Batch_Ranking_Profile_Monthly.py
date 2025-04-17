@@ -10,7 +10,9 @@ import json
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 import time
+from airflow.utils.timezone import make_aware
 
+ENVIRONMENT = "prod"
 
 # Function to get the previous month and year
 def get_previous_month():
@@ -18,15 +20,17 @@ def get_previous_month():
     first_day_of_current_month = current_date.replace(day=1)
     last_day_of_previous_month = first_day_of_current_month - timedelta(days=1)
 
-    prev_month = last_day_of_previous_month.month
-    prev_year = last_day_of_previous_month.year
+    #prev_month = last_day_of_previous_month.month
+    #prev_year = last_day_of_previous_month.year
+    prev_month = 4
+    prev_year = 2025
 
     return {"prev_month": prev_month, "prev_year": prev_year}
 
 
 default_args = {
     'owner': 'VM',
-    'start_date': datetime(2023, 6, 30),
+    'start_date': make_aware(datetime(2025, 3, 31)),
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 3,
@@ -80,8 +84,9 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         application="hdfs://192.168.10.167:9000/app/RecalculateTotalPointPerProfileMonthly.py",
         name="Recalculate_Profile",
         application_args=[
-            "{{ ti.xcom_pull(task_ids='begin_task', key='prev_month') }}",
-            "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}"
+            "--month", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_month') }}",
+            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}",
+            "--env", str(ENVIRONMENT)
         ],
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
         env_vars={"HADOOP_CONF_DIR": "/home/user/hadoop/etc/hadoop", "SPARK_HOME": "/home/user/spark"},
@@ -90,7 +95,7 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         conf={"spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"},
         driver_memory="512m",
         executor_memory="512m",
-        executor_cores="1",
+        executor_cores="4",
         num_executors="1"
     )
 
@@ -102,7 +107,8 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         name="Ranking_Profile",
         application_args=[
             "--month", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_month') }}",
-            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}"
+            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}",
+            "--env", str(ENVIRONMENT)
         ],
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
         env_vars={"HADOOP_CONF_DIR": "/home/user/hadoop/etc/hadoop", "SPARK_HOME": "/home/user/spark"},
@@ -111,7 +117,7 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         conf={"spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"},
         driver_memory="512m",
         executor_memory="512m",
-        executor_cores="1",
+        executor_cores="4",
         num_executors="1"
     )
 
@@ -123,7 +129,8 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         name="Membership_Profile",
         application_args=[
             "--month", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_month') }}",
-            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}"
+            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}",
+            "--env", str(ENVIRONMENT)
         ],
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
         env_vars={"HADOOP_CONF_DIR": "/home/user/hadoop/etc/hadoop", "SPARK_HOME": "/home/user/spark"},
@@ -132,7 +139,7 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         conf={"spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"},
         driver_memory="512m",
         executor_memory="512m",
-        executor_cores="1",
+        executor_cores="4",
         num_executors="1"
     )
 
@@ -144,7 +151,8 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         name="Load_Redis",
         application_args=[
             "--month", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_month') }}",
-            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}"
+            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}",
+            "--env", str(ENVIRONMENT)
         ],
         packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
         env_vars={"HADOOP_CONF_DIR": "/home/user/hadoop/etc/hadoop", "SPARK_HOME": "/home/user/spark"},
@@ -153,7 +161,7 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         conf={"spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"},
         driver_memory="512m",
         executor_memory="512m",
-        executor_cores="1",
+        executor_cores="4",
         num_executors="1"
     )
 
@@ -176,7 +184,27 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
         conf={"spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"},
         driver_memory="512m",
         executor_memory="512m",
-        executor_cores="1",
+        executor_cores="4",
+        num_executors="1"
+    )
+
+    Update_Membership_Profile = SparkSubmitOperator(
+        task_id="Update_Membership_Profile",
+        conn_id="spark_default",
+        application="hdfs://192.168.10.167:9000/app/UpdateMembershipForProfile.py",
+        name="Membership_Profile",
+        application_args=[
+            "--month", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_month') }}",
+            "--year", "{{ ti.xcom_pull(task_ids='begin_task', key='prev_year') }}"
+        ],
+        packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
+        env_vars={"HADOOP_CONF_DIR": "/home/user/hadoop/etc/hadoop", "SPARK_HOME": "/home/user/spark"},
+        archives="hdfs://192.168.10.167:9000/app/activityenv.tar.gz#activityenv",
+        py_files="hdfs://192.168.10.167:9000/app/lib_activity.zip",
+        conf={"spark.yarn.appMasterEnv.PYSPARK_PYTHON": "./activityenv/bin/python"},
+        driver_memory="512m",
+        executor_memory="512m",
+        executor_cores="4",
         num_executors="1"
     )
 
@@ -188,4 +216,4 @@ with DAG('Activity_Batch_Ranking_Profile_Monthly',
     )
 
     # Define task dependencies
-    begin_task >> Recalculate_Profile >> Ranking_Profile >> Membership_Profile >> Load_Redis >> Clone_To_Next_Month >> end_task
+    begin_task >> Recalculate_Profile >> Ranking_Profile >> Membership_Profile >> Load_Redis >> Clone_To_Next_Month >> Update_Membership_Profile >> end_task
