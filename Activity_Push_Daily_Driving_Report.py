@@ -166,7 +166,7 @@ with DAG('Activity_Push_Daily_Driving_Report', default_args=default_args,
             '--date', '{{ ti.xcom_pull(task_ids="begin_task") }}',
             '--env', str(ENVIRONMENT)
         ],
-        packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,org.mongodb.spark:mongo-spark-connector_2.12:10.1.1",
+        packages="io.delta:delta-core_2.12:2.2.0,org.apache.spark:spark-hive_2.12:3.3.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2,com.datastax.spark:spark-cassandra-connector_2.12:3.3.0",
         env_vars={"HADOOP_CONF_DIR": "/home/user/hadoop/etc/hadoop", "SPARK_HOME": "/home/user/spark"},
         archives="hdfs://192.168.10.167:9000/app/activityenv.tar.gz#activityenv",
         py_files="hdfs://192.168.10.167:9000/app/lib_activity.zip",

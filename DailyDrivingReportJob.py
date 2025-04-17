@@ -37,7 +37,7 @@ logger = logging.getLogger("DailyDrivingReportJob")
 
 
 def parse_arguments():
-    """Parse command line arguments"""
+    """Parse command line arguments with improved validation"""
     parser = argparse.ArgumentParser(description='Process daily driving reports and send events to Kafka')
 
     # Get yesterday's date as default
@@ -48,15 +48,27 @@ def parse_arguments():
     parser.add_argument('--env', choices=['dev', 'prod'], default='dev',
                         help='Environment to use (dev or prod)')
 
-    args = parser.parse_args()
-
-    # Parse the date string to validate format
+    # Parse arguments
     try:
-        process_date = datetime.strptime(args.date, '%Y-%m-%d')
-        return args.date, args.env, process_date
-    except ValueError as e:
-        logger.error(f"Invalid date format: {args.date}. Please use YYYY-MM-DD format.")
-        raise
+        args = parser.parse_args()
+
+        # Parse and validate the date string
+        try:
+            process_date = datetime.strptime(args.date, '%Y-%m-%d')
+
+            # Log the parsed parameters
+            logger.info(f"Parsed arguments:")
+            logger.info(f"  Date: {args.date} (parsed as: {process_date.strftime('%Y-%m-%d')})")
+            logger.info(f"  Environment: {args.env.upper()}")
+
+            return args.date, args.env, process_date
+        except ValueError:
+            logger.error(f"Invalid date format: {args.date}. Please use YYYY-MM-DD format.")
+            sys.exit(1)
+
+    except Exception as e:
+        logger.error(f"Error parsing arguments: {str(e)}")
+        sys.exit(1)
 
 
 def get_cassandra_config(env):
@@ -110,7 +122,7 @@ def get_redis_config(env):
             'hosts': ['192.168.11.180', '192.168.11.181', '192.168.11.182'],  # Update with all prod nodes
             'port': 6379,
             'password': 'CDp4VrUuy744Ur2fGd5uakRsWe4Pu3P8',  # Use the same password or update for prod
-            'prefix_key': 'vml',  # Assuming different prefix for prod
+            'prefix_key': 'vml',  # Assuming same prefix for prod
             'decode_responses': True
         }
 
@@ -558,7 +570,7 @@ def prepare_kafka_events(reports_df, device_mapping):
         uuid_udf = udf(lambda: str(uuid.uuid4()), StringType())
 
         # Function to convert distance from m to km and round
-        # Fix: Use simpler logic that doesn't rely on direct round() function
+        # Use a safer calculation
         meters_to_km_udf = udf(
             lambda meters: str(int(float(meters) / 1000)) if meters is not None else "0",
             StringType()
@@ -585,7 +597,7 @@ def prepare_kafka_events(reports_df, device_mapping):
             col("deviceimei"),
             col("phone"),
             col("distance").alias("distance_meters"),
-            lit(col("distance") / 1000).cast("float").alias("distance_km")
+            (col("distance") / 1000).cast("float").alias("distance_km")
         ).limit(5).show()
 
         # Count final events
@@ -612,14 +624,16 @@ def send_to_kafka(events_df, env):
         kafka_config = get_kafka_config(env)
         logger.info(f"Sending events to Kafka topic: {kafka_config['topic']}")
 
-        # MODIFIED: Package events individually instead of as an array
-        # Simply use to_json directly on the struct without wrapping in array()
+        # Package events into the proper format for Kafka
+        # Convert to array format first (wrapped in []) as expected by VML_ActivityEvent topic
         events_json_df = events_df.select(
             to_json(
-                struct(
-                    col("Id"), col("Phone"), col("Date"), col("Month"), col("Year"),
-                    col("TimeStamp"), col("MembershipCode"), col("Event"), col("ReportCode"),
-                    col("EventName"), col("ReportName"), col("Data")
+                array(
+                    struct(
+                        col("Id"), col("Phone"), col("Date"), col("Month"), col("Year"),
+                        col("TimeStamp"), col("MembershipCode"), col("Event"), col("ReportCode"),
+                        col("EventName"), col("ReportName"), col("Data")
+                    )
                 )
             ).alias("value")
         )
@@ -734,7 +748,7 @@ def main():
         logger.error(f"Job failed: {str(e)}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        sys.exit(1)
     finally:
         if 'spark' in locals() and spark:
             try:
