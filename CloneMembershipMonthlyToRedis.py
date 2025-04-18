@@ -118,7 +118,7 @@ def get_redis_config(env):
             'password': '0ef1sJm19w3OKHiH',
             'decode_responses': True,
             'index_name': 'activity-ranking-monthly-idx',
-            'key_prefix': 'activity-dev:membership:monthly:'
+            'key_prefix': 'activity_dev_membership_monthly:'
         }
     else:  # prod
         return {
@@ -127,7 +127,7 @@ def get_redis_config(env):
             'password': 'oPn7NjDi569uCriqYbm9iCvR',
             'decode_responses': True,
             'index_name': 'activity-ranking-monthly-idx',
-            'key_prefix': 'activity:membership:monthly:'
+            'key_prefix': 'activity_membership_monthly:'
         }
 
 
@@ -193,7 +193,7 @@ def process_batch(batch_df, redis_client, env):
         index_name = redis_config['index_name']
 
         # Process in smaller sub-batches for better control
-        sub_batch_size = 50
+        sub_batch_size = 200
         for i in range(0, len(records), sub_batch_size):
             sub_batch = records[i:i + sub_batch_size]
             pipeline = redis_client.pipeline(transaction=False)  # Use non-transactional pipeline for better performance
@@ -218,8 +218,7 @@ def process_batch(batch_df, redis_client, env):
                     }
 
                     # Queue delete and set operations
-                    pipeline.delete(doc_id)
-                    pipeline.json().set(doc_id, "$", new_doc)
+                    pipeline.json().set(doc_id, "$", new_doc, nx=False)  # nx=False means overwrite if exists
                     pipeline.sadd(index_name, doc_id)
                     sub_batch_inserts += 1
 
@@ -260,7 +259,6 @@ def process_batch(batch_df, redis_client, env):
                                 }
 
                                 # Clean up and retry individual record
-                                redis_client.delete(doc_id)
                                 redis_client.json().set(doc_id, "$", new_doc)
                                 redis_client.sadd(index_name, doc_id)
                                 inserts += 1

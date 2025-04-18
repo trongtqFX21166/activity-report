@@ -118,10 +118,10 @@ def load_profiles_from_postgres(spark, env):
             password=postgres_config["password"]
         )
 
-        # Query profiles
+        # Query profiles - now include MembershipCode field
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(
-                'SELECT "Id", "Phone", "Level", "TotalPoints", "Rank", "LastModified" FROM public."Profiles"'
+                'SELECT "Id", "Phone", "Level", "TotalPoints", "Rank", "LastModified", "MembershipCode" FROM public."Profiles"'
             )
             profiles = cursor.fetchall()
 
@@ -139,7 +139,8 @@ def load_profiles_from_postgres(spark, env):
                 "Level": profile["Level"] if profile["Level"] is not None else 1,
                 "TotalPoints": profile["TotalPoints"] if profile["TotalPoints"] is not None else 0,
                 "Rank": profile["Rank"] if profile["Rank"] is not None else 1,
-                "LastModified": profile["LastModified"]
+                "LastModified": profile["LastModified"],
+                "MembershipCode": profile["MembershipCode"] if profile["MembershipCode"] is not None else "Level1"
             }
             row_data.append(Row(**row))
 
@@ -154,7 +155,8 @@ def load_profiles_from_postgres(spark, env):
                 StructField("Level", IntegerType(), True),
                 StructField("TotalPoints", IntegerType(), True),
                 StructField("Rank", IntegerType(), True),
-                StructField("LastModified", TimestampType(), True)
+                StructField("LastModified", TimestampType(), True),
+                StructField("MembershipCode", StringType(), True)
             ])
             profiles_df = spark.createDataFrame([], schema)
 
@@ -175,10 +177,23 @@ def load_profiles_from_postgres(spark, env):
             StructField("Level", IntegerType(), True),
             StructField("TotalPoints", IntegerType(), True),
             StructField("Rank", IntegerType(), True),
-            StructField("LastModified", TimestampType(), True)
+            StructField("LastModified", TimestampType(), True),
+            StructField("MembershipCode", StringType(), True)
         ])
         empty_df = spark.createDataFrame([], schema)
         return empty_df
+
+
+def get_membership_name(code):
+    """Map membership code to a human-readable name"""
+    membership_map = {
+        "Level1": "Nhập môn",
+        "Level2": "Ngôi sao đang lên",
+        "Level3": "Uy tín",
+        "Level4": "Nổi tiếng",
+        "Level5": "Tối thượng"
+    }
+    return membership_map.get(code, "Nhập môn")
 
 
 def process_profiles(profiles_df):
@@ -188,6 +203,16 @@ def process_profiles(profiles_df):
         .withColumn("LastUpdated",
                     when(col("LastModified").isNotNull(), unix_timestamp(col("LastModified")))
                     .otherwise(unix_timestamp(current_timestamp())))
+
+    # Add membership name based on membership code
+    profiles_df = profiles_df \
+        .withColumn("MembershipName", expr("CASE " +
+                                          "WHEN MembershipCode = 'Level1' THEN 'Nhập môn' " +
+                                          "WHEN MembershipCode = 'Level2' THEN 'Ngôi sao đang lên' " +
+                                          "WHEN MembershipCode = 'Level3' THEN 'Uy tín' " +
+                                          "WHEN MembershipCode = 'Level4' THEN 'Nổi tiếng' " +
+                                          "WHEN MembershipCode = 'Level5' THEN 'Tối thượng' " +
+                                          "ELSE 'Nhập môn' END"))
 
     # Select only the fields we need (matching Redis schema)
     # Make sure we handle any missing columns
@@ -218,11 +243,30 @@ def process_profiles(profiles_df):
     else:
         columns_to_select.append(unix_timestamp(current_timestamp()).alias("LastUpdated"))
 
+    # Add the membership fields
+    if "MembershipCode" in profiles_df.columns:
+        columns_to_select.append(col("MembershipCode"))
+    else:
+        columns_to_select.append(lit("Level1").alias("MembershipCode"))
+
+    if "MembershipName" in profiles_df.columns:
+        columns_to_select.append(col("MembershipName"))
+    else:
+        columns_to_select.append(lit("Nhập môn").alias("MembershipName"))
+
     processed_df = profiles_df.select(*columns_to_select)
 
     # Handle null values
     processed_df = processed_df \
-        .fillna({"Phone": "unknown", "Level": 1, "TotalPoints": 0, "Rank": 999999, "LastUpdated": int(time.time())})
+        .fillna({
+            "Phone": "unknown",
+            "Level": 1,
+            "TotalPoints": 0,
+            "Rank": 999999,
+            "LastUpdated": int(time.time()),
+            "MembershipCode": "Level1",
+            "MembershipName": "Nhập môn"
+        })
 
     # Add a filter to ensure Phone is not null or empty
     processed_df = processed_df.filter(col("Phone").isNotNull() & (col("Phone") != ""))
@@ -230,7 +274,7 @@ def process_profiles(profiles_df):
     return processed_df
 
 
-def save_to_redis(df, env, batch_size=50):
+def save_to_redis(df, env, batch_size=500):
     """Save dataframe to Redis - running on driver for simplicity"""
     from redis import Redis
     import json
@@ -286,11 +330,12 @@ def save_to_redis(df, env, batch_size=50):
                         "Level": int(row["Level"]) if row["Level"] is not None else 1,
                         "TotalPoints": int(row["TotalPoints"]) if row["TotalPoints"] is not None else 0,
                         "Rank": int(row["Rank"]) if row["Rank"] is not None else 0,
-                        "LastUpdated": int(row["LastUpdated"]) if row["LastUpdated"] is not None else int(time.time())
+                        "LastUpdated": int(row["LastUpdated"]) if row["LastUpdated"] is not None else int(time.time()),
+                        "MembershipCode": row["MembershipCode"] if row["MembershipCode"] is not None else "Level1",
+                        "MembershipName": row["MembershipName"] if row["MembershipName"] is not None else "Nhập môn"
                     }
 
                     # Add to pipeline
-                    pipeline.delete(redis_key)
                     pipeline.json().set(redis_key, "$", profile_doc)
                     pipeline.sadd(redis_config['index_name'], redis_key)
                     success_count += 1
@@ -355,7 +400,7 @@ def main():
         processed_df.show(5, truncate=False)
 
         # Save to Redis with environment-specific configuration
-        total_rows, success_count, error_count = save_to_redis(processed_df, env)
+        total_rows, success_count, error_count = save_to_redis(processed_df, env, 1000)
 
         # Log summary
         logger.info(f"Profile to Redis Batch Process completed")

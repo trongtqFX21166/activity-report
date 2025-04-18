@@ -1,5 +1,6 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
+# Import specific functions instead of using wildcard to avoid shadowing built-ins
+from pyspark.sql.functions import col, desc, asc, lit, current_timestamp
 from redis import Redis
 import json
 import sys
@@ -27,7 +28,7 @@ def parse_arguments():
     parser.add_argument('--env', choices=['dev', 'prod'], default='dev', help='Environment (dev or prod)')
     parser.add_argument('-y', type=int, help='Year to process (e.g., 2024)')
 
-    # Parse known args to handle cases where additional arguments exist
+    # Parse known args to handle cases where addition al arguments exist
     args, _ = parser.parse_known_args()
 
     # Allow both --year and -y formats
@@ -166,7 +167,7 @@ def process_batch(batch_df, redis_client, env):
         index_name = redis_config['index_name']
 
         # Process in smaller sub-batches for better control
-        sub_batch_size = 50
+        sub_batch_size = 500
         for i in range(0, len(records), sub_batch_size):
             sub_batch = records[i:i + sub_batch_size]
             pipeline = redis_client.pipeline(transaction=False)  # Use non-transactional pipeline for better performance
@@ -190,7 +191,6 @@ def process_batch(batch_df, redis_client, env):
                     }
 
                     # Queue delete and set operations
-                    pipeline.delete(doc_id)
                     pipeline.json().set(doc_id, "$", new_doc)
                     pipeline.sadd(index_name, doc_id)
                     sub_batch_inserts += 1
@@ -231,7 +231,6 @@ def process_batch(batch_df, redis_client, env):
                                 }
 
                                 # Clean up and retry individual record
-                                redis_client.delete(doc_id)
                                 redis_client.json().set(doc_id, "$", new_doc)
                                 redis_client.sadd(index_name, doc_id)
                                 inserts += 1
@@ -334,11 +333,14 @@ def process_data(spark, redis_client, year=None, env='dev'):
         batch_size = 200  # Smaller batch size for better control
 
         # Repartition the dataframe for more efficient processing
-        # Fix: use built-in max function properly
+        # Safely calculate number of partitions using built-in max directly
+        num_partitions = 1
         if total_records > 0:
-            num_partitions = 1 if total_records <= batch_size else (total_records + batch_size - 1) // batch_size
-        else:
-            num_partitions = 1
+            num_partitions = 20
+
+        # If we're on a 'prod' environment, limit the max partitions to prevent overloading
+        if env == 'prod':
+            num_partitions = min(num_partitions, 20)  # Cap at 20 partitions for production
 
         logger.info(f"Processing with {num_partitions} partitions (batch size: {batch_size})")
 
