@@ -138,38 +138,6 @@ def check_dag_status(**context):
             print(f"DAG failure notification sent successfully. Status: {response.status_code}")
         except Exception as e:
             print(f"Failed to send DAG failure notification: {str(e)}")
-    else:
-        # Send success notification
-        message = {
-            "@type": "MessageCard",
-            "@context": "http://schema.org/extensions",
-            "themeColor": "00FF00",
-            "summary": f"✅ DAG {dag_id} succeeded",
-            "sections": [
-                {
-                    "activityTitle": f"✅ Airflow DAG Alert: DAG Succeeded",
-                    "activitySubtitle": f"DAG: {dag_id}",
-                    "facts": [
-                        {"name": "Execution Date", "value": execution_date},
-                        {"name": "Environment", "value": ENV}
-                    ],
-                    "text": "The Live Report verification process has completed successfully.",
-                    "markdown": True
-                }
-            ]
-        }
-
-        # Send the message to Teams
-        try:
-            response = requests.post(
-                TEAMS_WEBHOOK_URL,
-                data=json.dumps(message),
-                headers={"Content-Type": "application/json"}
-            )
-            response.raise_for_status()
-            print(f"DAG success notification sent successfully. Status: {response.status_code}")
-        except Exception as e:
-            print(f"Failed to send DAG success notification: {str(e)}")
 
 
 with DAG('TrafficReport_LiveReport_Verification', default_args=default_args,

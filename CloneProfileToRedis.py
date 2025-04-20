@@ -367,6 +367,58 @@ def save_to_redis(df, env, batch_size=500):
         if redis_client:
             redis_client.close()
 
+def create_profile_index(redis_client, index_name, prefix):
+    """Create RediSearch index for Profile Cache"""
+    try:
+        redis_client.ft(index_name).dropindex(delete_documents=False)
+
+        # Define schema as per requirements
+        schema = (
+            # Phone field made both searchable and sortable for flexible querying
+            TextField("$.Phone", as_name="Phone", sortable=True),
+
+            # Profile level and points
+            NumericField("$.Level", as_name="Level", sortable=True),
+            NumericField("$.TotalPoints", as_name="TotalPoints", sortable=True),
+            NumericField("$.Rank", as_name="Rank", sortable=True),
+
+            TextField("$.MembershipCode", as_name="MembershipCode", sortable=True),
+            TextField("$.MembershipName", as_name="MembershipName", sortable=True),
+
+            # Optional additional fields that might be useful
+            NumericField("$.LastUpdated", as_name="LastUpdated", sortable=True)
+        )
+
+        # Create the index
+        redis_client.ft(index_name).create_index(
+            schema,
+            definition=IndexDefinition(
+                prefix=[prefix],
+                index_type=IndexType.JSON
+            )
+        )
+
+        logger.info(f"""
+RediSearch index created successfully:
+- Index Name: {index_name}
+- Prefix: {prefix}
+- Schema:
+  - Phone (Text, Sortable, Searchable)
+  - Level (Numeric, Sortable)
+  - TotalPoints (Numeric, Sortable)
+  - Rank (Numeric, Sortable)
+  - LastUpdated (Numeric, Sortable)
+""")
+
+        # Test the index
+        info = redis_client.ft(index_name).info()
+        logger.info("\nIndex Info:")
+        for key, value in info.items():
+            logger.info(f"  {key}: {value}")
+
+    except Exception as e:
+        logger.error(f"Failed to create index: {str(e)}")
+        raise
 
 def main():
     """Main entry point for the Spark application"""

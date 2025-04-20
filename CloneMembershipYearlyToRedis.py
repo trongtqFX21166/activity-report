@@ -381,6 +381,60 @@ def process_data(spark, redis_client, year=None, env='dev'):
         logger.error(f"Error in data processing: {str(e)}")
         raise
 
+def create_ranking_index(redis_client, index_name, prefix):
+    """Create RediSearch index for ActivityRankingYearly"""
+    try:
+
+        redis_client.ft(index_name).dropindex(delete_documents=False)
+
+        # Define schema matching the C# model
+        schema = (
+            # Phone field made both searchable and sortable for flexible querying
+            TextField("$.Phone", as_name="Phone", sortable=True),
+
+            # Membership fields
+            TagField("$.MembershipCode", as_name="MembershipCode"),
+            TextField("$.MembershipName", as_name="MembershipName"),
+
+            # Time period fields
+            NumericField("$.Year", as_name="Year"),
+
+            # Ranking fields with sorting enabled
+            NumericField("$.Rank", as_name="Rank", sortable=True),
+            NumericField("$.TotalPoints", as_name="TotalPoints", sortable=True),
+        )
+
+        # Create the index
+        redis_client.ft(index_name).create_index(
+            schema,
+            definition=IndexDefinition(
+                prefix=[prefix],
+                index_type=IndexType.JSON
+            )
+        )
+
+        logger.info(f"""
+RediSearch index created successfully:
+- Index Name: {index_name}
+- Prefix: {prefix}
+- Schema:
+  - Phone (Text, Sortable, Searchable)
+  - MembershipCode (Tag)
+  - MembershipName (Text)
+  - Year (Numeric)
+  - Rank (Numeric, Sortable)
+  - TotalPoints (Numeric, Sortable)
+""")
+
+        # Test the index
+        info = redis_client.ft(index_name).info()
+        logger.info("\nIndex Info:")
+        for key, value in info.items():
+            logger.info(f"  {key}: {value}")
+
+    except Exception as e:
+        logger.error(f"Failed to create index: {str(e)}")
+        raise
 
 def main():
     """Main entry point of the script"""
