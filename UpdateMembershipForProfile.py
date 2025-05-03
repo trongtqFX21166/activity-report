@@ -81,25 +81,28 @@ def get_postgres_config(env):
             "password": "5d6v6hiFGGns4onnZGW0VfKe"
         }
 
-
 def create_spark_session(app_name, env):
     """Create Spark session with MongoDB configurations"""
     mongo_config = get_mongodb_config(env)
 
+    # Use the proper MongoDB connection URI format
+    mongo_uri = mongo_config['host']
+    database = mongo_config['database']
+
+    # Build SparkSession with proper MongoDB connector configuration
     builder = SparkSession.builder \
         .appName(f"{app_name}-{env}") \
-        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
-        .config("spark.mongodb.read.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.write.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.read.database", mongo_config['database']) \
-        .config("spark.mongodb.write.database", mongo_config['database'])
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
 
-    # Add authentication for production
-    if env == 'prod' and 'auth_source' in mongo_config:
-        builder = builder \
-            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
+    # Configure MongoDB connection with connection.uri which is the correct property
+    builder = builder.config("spark.mongodb.connection.uri", mongo_uri)
 
-    return builder.getOrCreate()
+    # Create and return the SparkSession
+    spark = builder.getOrCreate()
+    logger.info(f"Created SparkSession with app ID: {spark.sparkContext.applicationId}")
+    logger.info(f"Connected to MongoDB: {mongo_uri.split('@')[-1]} database: {database}")
+
+    return spark
 
 
 def get_postgres_connection(env):
