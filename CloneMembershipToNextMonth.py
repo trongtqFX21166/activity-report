@@ -170,6 +170,7 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
         source_data = spark.read \
             .format("mongodb") \
             .option("collection", source_collection) \
+            .option("readConcern.level", "majority") \
             .load()
 
         # Check if source data exists
