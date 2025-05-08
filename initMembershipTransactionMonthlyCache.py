@@ -19,7 +19,7 @@ def create_ranking_index(redis_client):
     try:
         # Index configuration
         INDEX_NAME = "activity-ranking-monthly-idx"
-        PREFIX = "activity-dev:membership:monthly:"
+        PREFIX = "activity_membership_monthly:"
 
         # Drop existing index if it exists
         try:

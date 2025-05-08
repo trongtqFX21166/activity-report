@@ -1,14 +1,27 @@
-from pyspark.sql import SparkSession
-# Import specific functions instead of using wildcard to avoid shadowing built-ins
-from pyspark.sql.functions import col, desc, asc, lit, current_timestamp
-from redis import Redis
-import json
-import sys
+#!/usr/bin/env python
+"""
+CloneMembershipMonthlyToRedis.py - Syncs membership data from MongoDB to Redis with optimized imports
+Support for both Redis standalone and cluster configurations
+"""
+
+# Standard library imports - group and sort for better readability
 import argparse
-from datetime import datetime
+import json
 import logging
 import os
+import sys
 import time
+from datetime import datetime
+
+# Third-party imports - import only what's needed and group by library
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, desc, lit
+
+# Lazy imports - these will be imported only when needed
+# from pymongo import MongoClient  # imported conditionally in get_mongodb_client
+
+# Redis imports - moved to setup_redis_connection to make them lazy
+# redis_imports will be done inside the function where they're needed
 
 # Configure logging
 logging.basicConfig(
@@ -72,7 +85,7 @@ def get_mongodb_client(env):
     """Create and return MongoDB client based on environment"""
     mongo_config = get_mongodb_config(env)
     try:
-        # Import here to ensure availability
+        # Import here to ensure availability - lazy import
         from pymongo import MongoClient
 
         # Create MongoDB client with appropriate settings
@@ -113,18 +126,23 @@ def get_redis_config(env):
     """Return Redis configuration for the specified environment"""
     if env == 'dev':
         return {
+            'is_cluster': False,
             'host': '192.168.8.226',
             'port': 6379,
             'password': '0ef1sJm19w3OKHiH',
             'decode_responses': True,
             'index_name': 'activity-ranking-monthly-idx',
-            'key_prefix': 'activity_dev_membership_monthly:'
+            'key_prefix': 'activity_membership_monthly:'
         }
     else:  # prod
         return {
-            'host': '192.168.11.84',
-            'port': 6379,
-            'password': 'oPn7NjDi569uCriqYbm9iCvR',
+            'is_cluster': True,
+            'nodes': [
+                {'host': '192.168.11.227', 'port': 6379},
+                {'host': '192.168.11.228', 'port': 6379},
+                {'host': '192.168.11.229', 'port': 6379}
+            ],
+            'password': '',
             'decode_responses': True,
             'index_name': 'activity-ranking-monthly-idx',
             'key_prefix': 'activity_membership_monthly:'
@@ -154,21 +172,51 @@ def create_spark_session(env):
 
 
 def setup_redis_connection(env):
-    """Setup Redis connection with environment-specific configuration"""
+    """Setup Redis connection with environment-specific configuration (cluster or standalone)"""
+    # Lazy import Redis modules only when needed
+    from redis import Redis
+    from redis.cluster import RedisCluster, ClusterNode
+
     redis_config = get_redis_config(env)
 
     try:
-        redis_client = Redis(
-            host=redis_config['host'],
-            port=redis_config['port'],
-            password=redis_config['password'],
-            decode_responses=redis_config['decode_responses']
-        )
+        # Check if we should use cluster mode
+        if redis_config.get('is_cluster', False):
+            # Convert node dictionaries to ClusterNode objects
+            cluster_nodes = [
+                ClusterNode(host=node['host'], port=node['port'])
+                for node in redis_config['nodes']
+            ]
+
+            logger.info(f"Connecting to Redis Cluster in {env} environment...")
+            logger.info(f"Cluster nodes: {', '.join([f'{node.host}:{node.port}' for node in cluster_nodes])}")
+
+            # Create Redis Cluster client
+            redis_client = RedisCluster(
+                startup_nodes=cluster_nodes,
+                password=redis_config['password'],
+                decode_responses=redis_config['decode_responses'],
+                skip_full_coverage_check=True  # More resilient to node failures
+            )
+        else:
+            # Standalone Redis connection
+            logger.info(
+                f"Connecting to standalone Redis in {env} environment at {redis_config['host']}:{redis_config['port']}")
+            redis_client = Redis(
+                host=redis_config['host'],
+                port=redis_config['port'],
+                password=redis_config['password'],
+                decode_responses=redis_config['decode_responses']
+            )
+
+        # Test connection
         redis_client.ping()
-        logger.info(f"Successfully connected to Redis ({env} environment)")
+        logger.info(f"Successfully connected to Redis{' Cluster' if redis_config.get('is_cluster', False) else ''}")
+
         return redis_client
     except Exception as e:
-        logger.error(f"Failed to connect to Redis: {str(e)}")
+        logger.error(
+            f"Failed to connect to Redis{' Cluster' if redis_config.get('is_cluster', False) else ''}: {str(e)}")
         sys.exit(1)
 
 
@@ -178,32 +226,116 @@ def generate_document_id(phone, month, year, env):
     return f"{redis_config['key_prefix']}{year}:{month}:{phone}"
 
 
+def check_index_exists(redis_client, index_name, env):
+    """Check if the search index exists, and create it if it doesn't"""
+    redis_config = get_redis_config(env)
+    prefix = redis_config['key_prefix']
+
+    try:
+        # Check if index exists
+        redis_client.ft(index_name).info()
+        logger.info(f"Search index {index_name} exists")
+        return True
+    except Exception as e:
+        if "unknown index name" in str(e).lower():
+            logger.warning(f"Search index {index_name} doesn't exist. Creating it now...")
+            create_ranking_index(redis_client, index_name, prefix)
+            return True
+        else:
+            logger.error(f"Error checking index: {str(e)}")
+            return False
+
+
+def create_ranking_index(redis_client, index_name, prefix):
+    """Create RediSearch index for ActivityRankingMonthly"""
+    try:
+        # Lazy import Redis search modules only when needed
+        from redis.commands.search.field import TextField, NumericField, TagField
+        from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+
+        # Define schema matching the C# model
+        schema = (
+            # Phone field made both searchable and sortable for flexible querying
+            TextField("$.Phone", as_name="Phone", sortable=True),
+
+            # Membership fields
+            TagField("$.MembershipCode", as_name="MembershipCode"),
+            TextField("$.MembershipName", as_name="MembershipName"),
+
+            # Time period fields
+            NumericField("$.Month", as_name="Month"),
+            NumericField("$.Year", as_name="Year"),
+
+            # Ranking fields with sorting enabled
+            NumericField("$.Rank", as_name="Rank", sortable=True),
+            NumericField("$.TotalPoints", as_name="TotalPoints", sortable=True),
+        )
+
+        # Create the index
+        redis_client.ft(index_name).create_index(
+            schema,
+            definition=IndexDefinition(
+                prefix=[prefix],
+                index_type=IndexType.JSON
+            )
+        )
+
+        logger.info(f"""
+RediSearch index created successfully:
+- Index Name: {index_name}
+- Prefix: {prefix}
+- Schema:
+  - Phone (Text, Sortable, Searchable)
+  - MembershipCode (Tag)
+  - MembershipName (Text)
+  - Month (Numeric)
+  - Year (Numeric)
+  - Rank (Numeric, Sortable)
+  - TotalPoints (Numeric, Sortable)
+""")
+
+        # Test the index
+        info = redis_client.ft(index_name).info()
+        logger.info("\nIndex Info:")
+        for key, value in info.items():
+            logger.info(f"  {key}: {value}")
+
+    except Exception as e:
+        logger.error(f"Failed to create index: {str(e)}")
+        raise
+
+
 def process_batch(batch_df, redis_client, env):
-    """Process a batch of records and upsert to Redis"""
+    """Process a batch of records and upsert to Redis (with cluster support)"""
     try:
         records = batch_df.collect()
         logger.info(f"Processing {len(records)} records in batch")
-
-        inserts = 0
-        updates = 0
-        errors = 0
 
         # Get Redis configuration
         redis_config = get_redis_config(env)
         index_name = redis_config['index_name']
 
+        # Check if index exists, create if needed
+        check_index_exists(redis_client, index_name, env)
+
+        # Track statistics
+        inserts = 0
+        errors = 0
+
         # Process in smaller sub-batches for better control
-        sub_batch_size = 200
+        sub_batch_size = 1000  # Smaller size for cluster
         for i in range(0, len(records), sub_batch_size):
             sub_batch = records[i:i + sub_batch_size]
-            pipeline = redis_client.pipeline(transaction=False)  # Use non-transactional pipeline for better performance
 
+            # With a cluster, we can't use a traditional pipeline
+            # Process each record individually, but track to log batches
             sub_batch_inserts = 0
+            sub_batch_errors = 0
+
             for record in sub_batch:
                 try:
                     # Generate document ID
                     doc_id = generate_document_id(record['phone'], record['month'], record['year'], env)
-                    logger.debug(f"Processing: {doc_id}")
 
                     # Create new document
                     new_doc = {
@@ -217,66 +349,34 @@ def process_batch(batch_df, redis_client, env):
                         "TotalPoints": record['totalpoints']
                     }
 
-                    # Queue delete and set operations
-                    pipeline.json().set(doc_id, "$", new_doc, nx=False)  # nx=False means overwrite if exists
-                    pipeline.sadd(index_name, doc_id)
+                    # Set in Redis and add to index
+                    redis_client.json().set(doc_id, "$", new_doc)
+                    redis_client.sadd(index_name, doc_id)
                     sub_batch_inserts += 1
 
                 except Exception as e:
-                    logger.error(f"Error preparing record {record['phone']}: {str(e)}")
-                    errors += 1
+                    logger.error(f"Error processing record {record['phone']}: {str(e)}")
+                    sub_batch_errors += 1
                     continue
 
-            # Execute pipeline for sub-batch with retry mechanism
-            max_retries = 3
-            retry_count = 0
-            retry_delay = 1  # seconds
+            # Update counters
+            inserts += sub_batch_inserts
+            errors += sub_batch_errors
 
-            while retry_count < max_retries:
-                try:
-                    pipeline.execute()
-                    inserts += sub_batch_inserts
-                    break  # Success, exit retry loop
-                except Exception as e:
-                    retry_count += 1
-                    logger.warning(f"Error executing pipeline (attempt {retry_count}/{max_retries}): {str(e)}")
+            # Log batch progress
+            logger.info(
+                f"Completed sub-batch {i // sub_batch_size + 1}/{(len(records) + sub_batch_size - 1) // sub_batch_size}: "
+                f"Success: {sub_batch_inserts}, Errors: {sub_batch_errors}")
 
-                    if retry_count >= max_retries:
-                        logger.error(f"Max retries reached. Processing records individually.")
-                        # If pipeline fails after all retries, try records individually
-                        for record in sub_batch:
-                            try:
-                                doc_id = generate_document_id(record['phone'], record['month'], record['year'], env)
-                                new_doc = {
-                                    "Id": doc_id,
-                                    "Phone": record['phone'],
-                                    "MembershipCode": record['membershipcode'],
-                                    "Month": record['month'],
-                                    "Year": record['year'],
-                                    "Rank": record['rank'],
-                                    "MembershipName": record['membershipname'],
-                                    "TotalPoints": record['totalpoints']
-                                }
+            # Add a small delay between batches to prevent overwhelming Redis Cluster
+            time.sleep(0.2)
 
-                                # Clean up and retry individual record
-                                redis_client.json().set(doc_id, "$", new_doc)
-                                redis_client.sadd(index_name, doc_id)
-                                inserts += 1
-                            except Exception as individual_error:
-                                logger.error(
-                                    f"Error processing individual record {record['phone']}: {str(individual_error)}")
-                                errors += 1
-                    else:
-                        # Wait before retrying
-                        time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-
-        logger.info(f"Sub-batch processing details:")
+        logger.info(f"Batch processing details:")
         logger.info(f"  Records to process: {len(records)}")
-        logger.info(f"  Successfully inserted: {inserts}")
+        logger.info(f"  Successfully processed: {inserts}")
         logger.info(f"  Errors: {errors}")
 
-        return inserts, updates, errors
+        return inserts, 0, errors  # updates is always 0 since we don't track separately
 
     except Exception as e:
         logger.error(f"Error processing batch: {str(e)}")
@@ -328,7 +428,7 @@ def process_data(spark, redis_client, month=None, year=None, env='dev'):
         batch_size = 200  # Smaller batch size for better control
 
         # Repartition the dataframe for more efficient processing
-        # Safely calculate number of partitions using built-in max directly
+        # Calculate number of partitions
         num_partitions = 1
         if total_records > 0:
             num_partitions = max(1, (total_records + batch_size - 1) // batch_size)
@@ -410,7 +510,7 @@ def main():
         # Initialize Spark
         spark = create_spark_session(env)
 
-        # Initialize Redis
+        # Initialize Redis with cluster support if in production
         redis_client = setup_redis_connection(env)
 
         # Process data for specified month/year or current month/year
