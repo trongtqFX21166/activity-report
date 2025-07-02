@@ -85,7 +85,7 @@ def get_live_reports(conn):
         current_time = int(time.time())  # current Unix timestamp
 
         query = """
-        SELECT id, cell_id, lat, lng, user_heading, category_id, expired_display_time, road_link_id
+        SELECT id, cell_id, lat, lng, user_heading, category_id, expired_display_time, road_link_id,number_of_view, number_of_confirm, number_of_rejection, minimization_hex_color, geom_type 
         FROM "live-report"
         WHERE expired_display_time > %s and status = 'Verified'
         """
@@ -96,14 +96,18 @@ def get_live_reports(conn):
         live_reports = []
         for row in results:
             report = {
-                "Id": str(row[0]),  # Convert UUID to string
-                "CellId": row[1],
-                "Lat": float(row[2]),  # Ensure proper type conversion
-                "Lng": float(row[3]),
-                "Heading": row[4],
-                "CategoryId": str(row[5]),  # Convert UUID to string
-                "ExpiredDisplayTimeUnix": row[6],
-                "RoadLinkId": row[7]
+                "id": str(row[0]),  # Convert UUID to string
+                "cell_id": row[1],
+                "lat": float(row[2]),  # Ensure proper type conversion
+                "lng": float(row[3]),
+                "user_heading": row[4],
+                "category_id": str(row[5]),  # Convert UUID to string
+                "expired_display_time": row[6],
+                "number_of_view": row[7],
+                "number_of_confirm": row[8],
+                "number_of_rejection": row[9],
+                "minimization_hex_color": row[10],
+                "geom_type": row[11]
             }
             live_reports.append(report)
 
@@ -134,6 +138,48 @@ def create_spark_session(env='dev'):
         .getOrCreate()
 
 
+def format_data_for_kafka(data, trans_id, total_records):
+    """Format data according to the new GeoJSON FeatureCollection structure"""
+    try:
+        # Create features array in GeoJSON format
+        features = []
+        for report in data:
+            feature = {
+                "geometry": {
+                    "coordinates": [report["Lng"], report["Lat"]],  # [longitude, latitude]
+                    "type": "Point"
+                },
+                "properties": {
+                    "id": report["id"],
+                    "heading": report["user_heading"],
+                    "expiredDisplayTimeUnix": report["expired_display_time"],
+                    "cellId": report["cell_id"] if report["cell_id"] else "",
+                    "numberOfView": report["number_of_view"],
+                    "numberOfConfirm": report["number_of_confirm"],
+                    "numberOfRejection": report["number_of_rejection"],
+                    "minimizationHexColor": report["minimization_hex_color"],
+                },
+                "type": "Feature"
+            }
+            features.append(feature)
+
+        # Create the complete message structure
+        message = {
+            "trans_id": trans_id,
+            "message_type": "LiveReportV2",
+            "data": {
+                "features": features,
+                "type": "FeatureCollection"
+            },
+            "total_records": total_records
+        }
+
+        return message
+    except Exception as e:
+        logger.error(f"Error formatting data for Kafka: {e}")
+        return None
+
+
 def send_to_kafka_with_spark(spark, data, trans_id, totalRecords, env='dev'):
     """Send data to Kafka using Spark's Kafka integration"""
     try:
@@ -141,36 +187,35 @@ def send_to_kafka_with_spark(spark, data, trans_id, totalRecords, env='dev'):
             logger.info("No data to send to Kafka")
             return
 
-        from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, ArrayType
+        from pyspark.sql.types import StructType, StructField, StringType
 
         kafka_config = KAFKA_CONFIG[env]
         topic = "MM_CompileLiveReport"
         bootstrap_servers = kafka_config["bootstrap_servers"]
 
-        # Convert data to JSON string
-        data_json = json.dumps(data)
+        # Format data according to the new structure
+        formatted_message = format_data_for_kafka(data, trans_id, totalRecords)
+        if not formatted_message:
+            logger.error("Failed to format data for Kafka")
+            return
 
-        # Create a single row DataFrame with the message structure
-        rows = [(trans_id, "LiveReport", data_json, totalRecords)]
+        # Convert message to JSON string
+        message_json = json.dumps(formatted_message)
+
+        # Create a single row DataFrame with the formatted message
+        rows = [(message_json,)]
         schema = StructType([
-            StructField("TransId", StringType(), False),
-            StructField("Type", StringType(), False),
-            StructField("Data", StringType(), False),
-            StructField("TotalRecords", IntegerType(), False),
+            StructField("value", StringType(), False)
         ])
 
         message_df = spark.createDataFrame(rows, schema)
 
-        # Convert the message to JSON string for Kafka
-        kafka_df = message_df.select(
-            to_json(struct("*")).alias("value")
-        )
-
         # Send to Kafka
         logger.info(f"Sending {len(data)} reports to Kafka topic {topic}")
+        logger.info(f"Sample message format: {json.dumps(formatted_message, indent=2)[:500]}...")
 
         # Configure Kafka writer with SASL properties
-        kafka_df.write \
+        message_df.write \
             .format("kafka") \
             .option("kafka.bootstrap.servers", bootstrap_servers) \
             .option("kafka.security.protocol", kafka_config["security_protocol"]) \
