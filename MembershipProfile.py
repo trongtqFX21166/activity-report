@@ -99,7 +99,7 @@ def get_mongodb_connection(env):
         raise
 
 
-def get_membership_mapping():
+def get_membership_mapping() -> object:
     """Define membership levels based on rank percentiles"""
     return [
         (0.00, 0.01, "Level5", "Tối thượng"),  # Top 1%
@@ -175,7 +175,7 @@ def read_from_mongodb(spark, month, year, env):
 def assign_membership_levels(df):
     """Assign membership levels based on rank percentiles and point thresholds"""
     # Calculate total number of users
-    total_users = df.count()
+    total_users = df.filter(col("totalpoints") > 0).count()
 
     if total_users == 0:
         logger.info("No users found in the dataset")
@@ -195,12 +195,12 @@ def assign_membership_levels(df):
     mappings = get_membership_mapping()
     membership_conditions = []
 
-    for min_perc, max_perc, code, name in mappings:
-        condition = (
-            when((col("percentile") > min_perc) & (col("percentile") <= max_perc) & (col("totalpoints") >= 200),
-                 struct(lit(code).alias("code"), lit(name).alias("name")))
-        )
-        membership_conditions.append(condition)
+    # for min_perc, max_perc, code, name in mappings:
+    #     condition = (
+    #         when((col("percentile") > min_perc) & (col("percentile") <= max_perc) & (col("totalpoints") >= 200),
+    #              struct(lit(code).alias("code"), lit(name).alias("name")))
+    #     )
+    #     membership_conditions.append(condition)
 
     # Add absolute points threshold for Level2
     level2_condition = when(

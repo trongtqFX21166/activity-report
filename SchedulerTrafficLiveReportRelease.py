@@ -85,7 +85,7 @@ def get_live_reports(conn):
         current_time = int(time.time())  # current Unix timestamp
 
         query = """
-        SELECT id, cell_id, lat, lng, user_heading, category_id, expired_display_time, road_link_id,number_of_view, number_of_confirm, number_of_rejection, minimization_hex_color, geom_type 
+        SELECT id, cell_id, lat, lng, user_heading, category_id, expired_display_time, road_link_id,number_of_view, number_of_confirm, number_of_rejection, minimization_hex_color, geom_type, lines 
         FROM "live-report"
         WHERE expired_display_time > %s and status = 'Verified'
         """
@@ -107,7 +107,8 @@ def get_live_reports(conn):
                 "number_of_confirm": row[8],
                 "number_of_rejection": row[9],
                 "minimization_hex_color": row[10],
-                "geom_type": row[11]
+                "geom_type": row[11],
+                "lines": row[12]
             }
             live_reports.append(report)
 

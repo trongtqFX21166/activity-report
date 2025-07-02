@@ -2,6 +2,7 @@
 """
 CloneProfileToRedis.py - Loads profiles from PostgreSQL to Redis
 Compatible with Spark cluster mode deployment via Airflow
+With support for both Redis standalone and Redis Cluster configurations
 
 Usage:
     spark-submit CloneProfileToRedis.py --month [MONTH] --year [YEAR] --env [dev|prod]
@@ -12,8 +13,8 @@ Parameters:
     --env        : Environment to use (dev or prod), defaults to 'dev'
 """
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
+from pyspark.sql.functions import col, lit, when, expr, unix_timestamp, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, TimestampType, LongType
 import json
 import time
 from datetime import datetime
@@ -58,35 +59,40 @@ def get_postgres_config(env):
             "user": "postgres",
             "password": "admin123."
         }
-    else:  # prod
-        return {
-            "host": "192.168.11.83",
-            "database": "ActivityDB",
-            "user": "vmladmin",
-            "password": "5d6v6hiFGGns4onnZGW0VfKe"
-        }
+    # Production environment
+    return {
+        "host": "192.168.11.83",
+        "database": "ActivityDB",
+        "user": "vmladmin",
+        "password": "5d6v6hiFGGns4onnZGW0VfKe"
+    }
 
 
 def get_redis_config(env):
     """Return Redis configuration for the specified environment"""
     if env == 'dev':
         return {
+            'is_cluster': False,
             'host': '192.168.8.226',
             'port': 6379,
             'password': '0ef1sJm19w3OKHiH',
             'decode_responses': True,
             'index_name': 'activity-profile-idx',
-            'key_prefix': 'activity-dev:profile:'
+            'key_prefix': 'activity_profile:'
         }
-    else:  # prod
-        return {
-            'host': '192.168.11.84',
-            'port': 6379,
-            'password': 'oPn7NjDi569uCriqYbm9iCvR',
-            'decode_responses': True,
-            'index_name': 'activity-profile-idx',
-            'key_prefix': 'activity:profile:'
-        }
+    # Production environment uses Redis Cluster
+    return {
+        'is_cluster': True,
+        'nodes': [
+            {'host': '192.168.11.227', 'port': 6379},
+            {'host': '192.168.11.228', 'port': 6379},
+            {'host': '192.168.11.229', 'port': 6379}
+        ],
+        'password': '',
+        'decode_responses': True,
+        'index_name': 'activity-profile-idx',
+        'key_prefix': 'activity_profile:'
+    }
 
 
 def create_spark_session(env):
@@ -147,7 +153,9 @@ def load_profiles_from_postgres(spark, env):
         # Create the DataFrame directly
         if row_data:
             profiles_df = spark.createDataFrame(row_data)
-        else:
+
+        # Create an empty dataframe if no data found
+        if not row_data:
             # Create an empty dataframe with the expected schema
             schema = StructType([
                 StructField("Id", StringType(), True),
@@ -207,12 +215,12 @@ def process_profiles(profiles_df):
     # Add membership name based on membership code
     profiles_df = profiles_df \
         .withColumn("MembershipName", expr("CASE " +
-                                          "WHEN MembershipCode = 'Level1' THEN 'Nhập môn' " +
-                                          "WHEN MembershipCode = 'Level2' THEN 'Ngôi sao đang lên' " +
-                                          "WHEN MembershipCode = 'Level3' THEN 'Uy tín' " +
-                                          "WHEN MembershipCode = 'Level4' THEN 'Nổi tiếng' " +
-                                          "WHEN MembershipCode = 'Level5' THEN 'Tối thượng' " +
-                                          "ELSE 'Nhập môn' END"))
+                                           "WHEN MembershipCode = 'Level1' THEN 'Nhập môn' " +
+                                           "WHEN MembershipCode = 'Level2' THEN 'Ngôi sao đang lên' " +
+                                           "WHEN MembershipCode = 'Level3' THEN 'Uy tín' " +
+                                           "WHEN MembershipCode = 'Level4' THEN 'Nổi tiếng' " +
+                                           "WHEN MembershipCode = 'Level5' THEN 'Tối thượng' " +
+                                           "ELSE 'Nhập môn' END"))
 
     # Select only the fields we need (matching Redis schema)
     # Make sure we handle any missing columns
@@ -259,14 +267,14 @@ def process_profiles(profiles_df):
     # Handle null values
     processed_df = processed_df \
         .fillna({
-            "Phone": "unknown",
-            "Level": 1,
-            "TotalPoints": 0,
-            "Rank": 999999,
-            "LastUpdated": int(time.time()),
-            "MembershipCode": "Level1",
-            "MembershipName": "Nhập môn"
-        })
+        "Phone": "unknown",
+        "Level": 1,
+        "TotalPoints": 0,
+        "Rank": 999999,
+        "LastUpdated": int(time.time()),
+        "MembershipCode": "Level1",
+        "MembershipName": "Nhập môn"
+    })
 
     # Add a filter to ensure Phone is not null or empty
     processed_df = processed_df.filter(col("Phone").isNotNull() & (col("Phone") != ""))
@@ -274,103 +282,86 @@ def process_profiles(profiles_df):
     return processed_df
 
 
-def save_to_redis(df, env, batch_size=500):
-    """Save dataframe to Redis - running on driver for simplicity"""
+def setup_redis_connection(env):
+    """Setup Redis connection with environment-specific configuration"""
     from redis import Redis
-    import json
+    from redis.cluster import RedisCluster, ClusterNode
 
-    # Get Redis configuration for the environment
     redis_config = get_redis_config(env)
 
-    # Log the function execution
-    logger.info(f"Starting save_to_redis with {df.count()} records to Redis ({env} environment)")
-    logger.info(f"Redis host: {redis_config['host']}, port: {redis_config['port']}")
-
-    # First collect data to driver
-    rows = df.collect()
-    logger.info(f"Collected {len(rows)} rows to driver")
-
-    # Establish Redis connection on driver
-    redis_client = None
     try:
-        # Create Redis connection
+        # Check if we should use cluster mode
+        if redis_config.get('is_cluster', False):
+            # Convert node dictionaries to ClusterNode objects
+            cluster_nodes = [
+                ClusterNode(host=node['host'], port=node['port'])
+                for node in redis_config['nodes']
+            ]
+
+            logger.info(f"Connecting to Redis Cluster in {env} environment...")
+            logger.info(f"Cluster nodes: {', '.join([f'{node.host}:{node.port}' for node in cluster_nodes])}")
+
+            # Create Redis Cluster client
+            redis_client = RedisCluster(
+                startup_nodes=cluster_nodes,
+                password=redis_config['password'],
+                decode_responses=redis_config['decode_responses'],
+                skip_full_coverage_check=True  # More resilient to node failures
+            )
+            # Test connection
+            redis_client.ping()
+            logger.info(f"Successfully connected to Redis Cluster")
+            return redis_client
+
+        # Standalone Redis connection (if not cluster mode)
+        logger.info(
+            f"Connecting to standalone Redis in {env} environment at {redis_config['host']}:{redis_config['port']}")
         redis_client = Redis(
             host=redis_config['host'],
             port=redis_config['port'],
             password=redis_config['password'],
             decode_responses=redis_config['decode_responses']
         )
-
         # Test connection
         redis_client.ping()
-        logger.info("Successfully connected to Redis")
-
-        # Process in batches
-        total_rows = len(rows)
-        total_success = 0
-        total_errors = 0
-
-        # Split into batches
-        for i in range(0, total_rows, batch_size):
-            batch = rows[i:i + batch_size]
-
-            # Process batch
-            pipeline = redis_client.pipeline(transaction=False)
-            success_count = 0
-            error_count = 0
-
-            for row in batch:
-                try:
-                    # Generate Redis key
-                    redis_key = f"{redis_config['key_prefix']}{row['Phone']}"
-
-                    # Create Redis document - matching schema exactly
-                    profile_doc = {
-                        "Phone": row["Phone"],
-                        "Level": int(row["Level"]) if row["Level"] is not None else 1,
-                        "TotalPoints": int(row["TotalPoints"]) if row["TotalPoints"] is not None else 0,
-                        "Rank": int(row["Rank"]) if row["Rank"] is not None else 0,
-                        "LastUpdated": int(row["LastUpdated"]) if row["LastUpdated"] is not None else int(time.time()),
-                        "MembershipCode": row["MembershipCode"] if row["MembershipCode"] is not None else "Level1",
-                        "MembershipName": row["MembershipName"] if row["MembershipName"] is not None else "Nhập môn"
-                    }
-
-                    # Add to pipeline
-                    pipeline.json().set(redis_key, "$", profile_doc)
-                    pipeline.sadd(redis_config['index_name'], redis_key)
-                    success_count += 1
-
-                except Exception as e:
-                    logger.error(f"Error preparing Redis document for {row['Phone']}: {str(e)}")
-                    error_count += 1
-
-            # Execute pipeline
-            try:
-                pipeline.execute()
-                logger.info(f"Batch {i // batch_size + 1}: Successfully loaded {success_count} profiles")
-                total_success += success_count
-            except Exception as e:
-                logger.error(f"Error executing Redis pipeline: {str(e)}")
-                # Count all as failures
-                total_errors += success_count + error_count
-
-            # Sleep briefly between batches
-            time.sleep(0.1)
-
-        # Return stats
-        return total_rows, total_success, total_errors
+        logger.info(f"Successfully connected to standalone Redis")
+        return redis_client
 
     except Exception as e:
-        logger.error(f"Error in save_to_redis: {str(e)}")
-        return 0, 0, 0
-    finally:
-        if redis_client:
-            redis_client.close()
+        logger.error(
+            f"Failed to connect to Redis{' Cluster' if redis_config.get('is_cluster', False) else ''}: {str(e)}")
+        sys.exit(1)
+
+
+def check_index_exists(redis_client, index_name, env):
+    """Check if the search index exists, and create it if it doesn't"""
+    try:
+        # Check if index exists
+        redis_client.ft(index_name).info()
+        logger.info(f"Search index {index_name} exists")
+        return True
+    except Exception as e:
+        if "unknown index name" in str(e).lower():
+            logger.warning(f"Search index {index_name} doesn't exist. Creating it now...")
+            create_profile_index(redis_client, index_name, get_redis_config(env)['key_prefix'])
+            return True
+        # Other errors
+        logger.error(f"Error checking index: {str(e)}")
+        return False
+
 
 def create_profile_index(redis_client, index_name, prefix):
     """Create RediSearch index for Profile Cache"""
     try:
-        redis_client.ft(index_name).dropindex(delete_documents=False)
+        from redis.commands.search.field import TextField, NumericField, TagField
+        from redis.commands.search.indexDefinition import IndexDefinition, IndexType
+
+        try:
+            # Try to drop existing index
+            redis_client.ft(index_name).dropindex(delete_documents=False)
+            logger.info(f"Dropped existing index: {index_name}")
+        except Exception as e:
+            logger.warning(f"No existing index to drop or error dropping index: {str(e)}")
 
         # Define schema as per requirements
         schema = (
@@ -407,6 +398,8 @@ RediSearch index created successfully:
   - Level (Numeric, Sortable)
   - TotalPoints (Numeric, Sortable)
   - Rank (Numeric, Sortable)
+  - MembershipCode (Text, Sortable)
+  - MembershipName (Text, Sortable)
   - LastUpdated (Numeric, Sortable)
 """)
 
@@ -419,6 +412,102 @@ RediSearch index created successfully:
     except Exception as e:
         logger.error(f"Failed to create index: {str(e)}")
         raise
+
+
+def save_to_redis(df, env, batch_size=200):
+    """Save dataframe to Redis - handles both standalone and cluster modes"""
+    # Get Redis configuration for the environment
+    redis_config = get_redis_config(env)
+
+    # Log the function execution
+    logger.info(f"Starting save_to_redis with {df.count()} records to Redis ({env} environment)")
+
+    if redis_config.get('is_cluster', False):
+        logger.info(
+            f"Using Redis Cluster mode with nodes")
+    else:
+        logger.info(f"Using standalone Redis at {redis_config['host']}:{redis_config['port']}")
+
+    # First collect data to driver
+    rows = df.collect()
+    logger.info(f"Collected {len(rows)} rows to driver")
+
+    # Establish Redis connection on driver
+    redis_client = None
+
+    try:
+        # Create Redis connection
+        redis_client = setup_redis_connection(env)
+
+        # Check if the index exists, create if needed
+        index_name = redis_config['index_name']
+        check_index_exists(redis_client, index_name, env)
+
+        # Process in batches
+        total_rows = len(rows)
+        total_success = 0
+        total_errors = 0
+
+        # Split into batches
+        for i in range(0, total_rows, batch_size):
+            batch = rows[i:i + batch_size]
+            batch_size_actual = len(batch)
+
+            # Calculate total batches
+            total_batches = (total_rows + batch_size - 1) // batch_size
+            current_batch = i // batch_size + 1
+
+            logger.info(f"Processing batch {current_batch} of {total_batches} ({batch_size_actual} profiles)")
+
+            # Process each profile in the batch
+            success_count = 0
+            error_count = 0
+
+            # In cluster mode, we need to process individually without pipeline
+            for row in batch:
+                try:
+                    # Generate Redis key
+                    redis_key = f"{redis_config['key_prefix']}{row['Phone']}"
+
+                    # Create Redis document - matching schema exactly
+                    profile_doc = {
+                        "Phone": row["Phone"],
+                        "Level": int(row["Level"]) if row["Level"] is not None else 1,
+                        "TotalPoints": int(row["TotalPoints"]) if row["TotalPoints"] is not None else 0,
+                        "Rank": int(row["Rank"]) if row["Rank"] is not None else 0,
+                        "LastUpdated": int(row["LastUpdated"]) if row["LastUpdated"] is not None else int(time.time()),
+                        "MembershipCode": row["MembershipCode"] if row["MembershipCode"] is not None else "Level1",
+                        "MembershipName": row["MembershipName"] if row["MembershipName"] is not None else "Nhập môn"
+                    }
+
+                    # Set in Redis and add to index
+                    redis_client.json().set(redis_key, "$", profile_doc)
+                    redis_client.sadd(redis_config['index_name'], redis_key)
+                    success_count += 1
+
+                except Exception as e:
+                    logger.error(f"Error updating Redis for {row['Phone']}: {str(e)}")
+                    error_count += 1
+
+            # Log batch progress
+            logger.info(f"Batch {current_batch}/{total_batches}: Success: {success_count}, Errors: {error_count}")
+            total_success += success_count
+            total_errors += error_count
+
+            # Add a small delay between batches to prevent overwhelming Redis
+            time.sleep(0.1)
+
+        # Return stats
+        logger.info(f"Redis update completed: {total_success} successful, {total_errors} errors")
+        return total_rows, total_success, total_errors
+
+    except Exception as e:
+        logger.error(f"Error in save_to_redis: {str(e)}")
+        return 0, 0, 0
+    finally:
+        if redis_client:
+            redis_client.close()
+
 
 def main():
     """Main entry point for the Spark application"""
@@ -452,7 +541,7 @@ def main():
         processed_df.show(5, truncate=False)
 
         # Save to Redis with environment-specific configuration
-        total_rows, success_count, error_count = save_to_redis(processed_df, env, 1000)
+        total_rows, success_count, error_count = save_to_redis(processed_df, env, 500)
 
         # Log summary
         logger.info(f"Profile to Redis Batch Process completed")

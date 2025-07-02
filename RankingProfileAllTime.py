@@ -7,6 +7,8 @@ from psycopg2.extras import execute_batch
 import logging
 import os
 import sys
+import time
+import random
 
 # Configure logging
 logging.basicConfig(
@@ -204,7 +206,7 @@ def calculate_unique_ranks(profiles, env):
 
 
 def update_ranks_in_postgres(updates, env):
-    """Update ranks in PostgreSQL"""
+    """Update ranks in PostgreSQL with deadlock prevention"""
     if not updates:
         logger.info("No rank updates to apply")
         return 0
@@ -213,7 +215,11 @@ def update_ranks_in_postgres(updates, env):
     try:
         conn = get_postgres_connection(env)
 
-        # Prepare update query - similar to RankingProfileMonthly.py but adapted for Profiles table
+        # Set a short transaction timeout to prevent long-running deadlocks
+        with conn.cursor() as cursor:
+            cursor.execute("SET statement_timeout = '30s'")
+
+        # Prepare update query
         update_query = """
             UPDATE public."Profiles"
             SET "Rank" = %s,
@@ -237,15 +243,51 @@ def update_ranks_in_postgres(updates, env):
                 )
             )
 
-        # Execute batch update
-        with conn.cursor() as cursor:
-            execute_batch(cursor, update_query, batch_data, page_size=1000)
+        # Process updates in smaller batches to reduce deadlock probability
+        batch_size = 100
+        total_updated = 0
+        max_retries = 3
 
-        # Commit the transaction
-        conn.commit()
+        # Randomize the order of updates to help prevent deadlocks
+        random.shuffle(batch_data)
+        logger.info(f"Processing {len(batch_data)} updates in batches of {batch_size}")
 
-        logger.info(f"Successfully updated {len(updates)} profile ranks in PostgreSQL")
-        return len(updates)
+        for i in range(0, len(batch_data), batch_size):
+            current_batch = batch_data[i:i + batch_size]
+            retries = 0
+            success = False
+
+            # Retry logic for each batch
+            while not success and retries < max_retries:
+                try:
+                    with conn.cursor() as cursor:
+                        execute_batch(cursor, update_query, current_batch, page_size=batch_size)
+                    conn.commit()
+                    batch_updated = len(current_batch)
+                    total_updated += batch_updated
+                    logger.info(f"Batch {i // batch_size + 1}: Successfully updated {batch_updated} profile ranks")
+                    success = True
+                except psycopg2.errors.DeadlockDetected as e:
+                    retries += 1
+                    conn.rollback()
+                    logger.warning(f"Deadlock detected in batch {i // batch_size + 1}, retry {retries}/{max_retries}")
+
+                    # Add random delay before retry to help prevent deadlocks
+                    sleep_time = 1 + (random.random() * retries)
+                    time.sleep(sleep_time)
+
+                    # Shuffle the batch to change the order of updates
+                    random.shuffle(current_batch)
+                except Exception as e:
+                    conn.rollback()
+                    logger.error(f"Error updating ranks in batch {i // batch_size + 1}: {str(e)}")
+                    raise
+
+            if not success:
+                logger.error(f"Failed to update batch {i // batch_size + 1} after {max_retries} retries")
+
+        logger.info(f"Successfully updated {total_updated} profile ranks in PostgreSQL")
+        return total_updated
 
     except Exception as e:
         logger.error(f"Error updating ranks in PostgreSQL: {str(e)}")

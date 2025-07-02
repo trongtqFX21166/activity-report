@@ -92,6 +92,7 @@ def create_spark_session(app_name, env):
     # Build SparkSession with proper MongoDB connector configuration
     builder = SparkSession.builder \
         .appName(f"{app_name}-{env}") \
+        .config("spark.mongodb.database", database) \
         .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
 
     # Configure MongoDB connection with connection.uri which is the correct property
@@ -189,6 +190,7 @@ def get_mongodb_membership_data(year, month, env):
         # Read from MongoDB
         df = spark.read \
             .format("mongodb") \
+            .option("database", 'activity_membershiptransactionmonthly') \
             .option("collection", collection_name) \
             .option("readConcern.level", "majority") \
             .load()

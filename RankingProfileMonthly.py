@@ -1,31 +1,60 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
-from pyspark.sql.window import Window
 from datetime import datetime
-from pymongo import MongoClient, UpdateOne
-import pytz
-import argparse
+import calendar
 import sys
+import argparse
 import os
+from pymongo import MongoClient, UpdateOne, InsertOne
+import pytz
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("CloneMembershipToNextMonth")
 
 
-def get_environment():
-    """
-    Determine the execution environment (dev or prod).
-    Can be specified as a command-line argument or environment variable.
-    Defaults to 'dev' if not specified.
-    """
-    # Check command line arguments
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ['dev', 'prod']:
-        return sys.argv[1].lower()
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Clone membership data from one month to the next')
+    parser.add_argument('--source-month', type=int, help='Source month (1-12)')
+    parser.add_argument('--source-year', type=int, help='Source year (e.g., 2024)')
+    parser.add_argument('--target-month', type=int, help='Target month (1-12), defaults to next month')
+    parser.add_argument('--target-year', type=int, help='Target year (e.g., 2024), defaults to appropriate year')
+    parser.add_argument('--env', choices=['dev', 'prod'], default='dev', help='Environment (dev or prod)')
 
-    # Check environment variables
-    env = os.environ.get('ENVIRONMENT', 'dev').lower()
-    if env in ['dev', 'prod']:
-        return env
+    # Handle positional arguments for backward compatibility
+    if len(sys.argv) > 1 and sys.argv[1].isdigit():
+        # Old style: script.py source_month source_year [target_month target_year]
+        args = []
+        if len(sys.argv) > 1:
+            args.extend(['--source-month', sys.argv[1]])
+        if len(sys.argv) > 2:
+            args.extend(['--source-year', sys.argv[2]])
+        if len(sys.argv) > 3:
+            args.extend(['--target-month', sys.argv[3]])
+        if len(sys.argv) > 4:
+            args.extend(['--target-year', sys.argv[4]])
 
-    # Default to dev
-    return 'dev'
+        # Parse with our custom args list
+        args = parser.parse_args(args)
+    else:
+        # Parse normally with command line args
+        args = parser.parse_args()
+
+    # Check environment variables if environment not specified
+    if not hasattr(args, 'env') or not args.env:
+        env = os.environ.get('ENVIRONMENT', 'dev').lower()
+        if env in ['dev', 'prod']:
+            args.env = env
+
+    return args
 
 
 def get_mongodb_config(env):
@@ -36,10 +65,11 @@ def get_mongodb_config(env):
             'database': 'activity_membershiptransactionmonthly_dev'
         }
     else:  # prod
+        # Fixed the connection string format for production environment
+        # Using proper format with authSource parameter in the URI itself
         return {
-            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
-            'database': 'activity_membershiptransactionmonthly',
-            'auth_source': 'admin'
+            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017/?authSource=admin',
+            'database': 'activity_membershiptransactionmonthly'
         }
 
 
@@ -47,184 +77,204 @@ def create_spark_session(env):
     """Create Spark session with MongoDB configurations"""
     mongo_config = get_mongodb_config(env)
 
+    # Use the proper MongoDB connection URI format
+    mongo_uri = mongo_config['host']
+    database = mongo_config['database']
+
+    # Build SparkSession with proper MongoDB connector configuration
     builder = SparkSession.builder \
-        .appName(f"membershiptransactionmonthly_ranking_{env}") \
+        .appName(f"membership-monthly-cloner-{env}") \
         .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
 
-    # Add MongoDB configuration
-    builder = builder \
-        .config("spark.mongodb.read.connection.uri", mongo_config['host']) \
-        .config("spark.mongodb.write.connection.uri", mongo_config['host']) \
-        .config("spark.mongodb.read.database", mongo_config['database']) \
-        .config("spark.mongodb.write.database", mongo_config['database'])
+    # Configure MongoDB connection with connection.uri which is the correct property
+    builder = builder.config("spark.mongodb.connection.uri", mongo_uri)
 
-    if 'auth_source' in mongo_config:
-        builder = builder \
-            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
+    # Create and return the SparkSession
+    spark = builder.getOrCreate()
+    logger.info(f"Created SparkSession with app ID: {spark.sparkContext.applicationId}")
+    logger.info(f"Connected to MongoDB: {mongo_uri.split('@')[-1]} database: {database}")
 
-    return builder.getOrCreate()
+    return spark
 
 
 def get_mongodb_connection(env):
     """Create MongoDB client connection"""
-    mongo_config = get_mongodb_config(env)
     try:
-        if env == 'dev':
-            client = MongoClient(mongo_config['host'])
-        else:  # prod
-            client = MongoClient(
-                mongo_config['host'],
-                authSource=mongo_config['auth_source']
-            )
-        return client
+        mongo_config = get_mongodb_config(env)
+
+        # Use the URI directly which includes authentication if needed
+        client = MongoClient(mongo_config['host'])
+
+        # Test connection
+        client.admin.command('ping')
+        logger.info(f"Successfully connected to MongoDB ({env} environment)")
+        return client, mongo_config['database']
     except Exception as e:
-        print(f"Error connecting to MongoDB: {str(e)}")
+        logger.error(f"Error connecting to MongoDB: {str(e)}")
         raise
 
 
-def get_current_month_year():
-    """Get current month and year in Vietnam timezone"""
-    vietnam_tz = pytz.timezone('Asia/Ho_Chi_Minh')
-    now = datetime.now(vietnam_tz)
-    return now.month, now.year
+def get_next_month_year(current_month, current_year):
+    """Calculate next month and year"""
+    if current_month == 12:
+        return 1, current_year + 1
+    return current_month + 1, current_year
 
 
-def validate_month_year(month, year):
-    """Validate if month and year are within acceptable ranges"""
+def validate_date(month, year):
+    """Validate if the provided month and year are valid"""
     try:
         if not (1 <= month <= 12):
             raise ValueError(f"Month must be between 1 and 12, got {month}")
 
-        if not (2000 <= year <= 2100):
-            raise ValueError(f"Year must be between 2000 and 2100, got {year}")
-
-        # Try to create a date to validate
+        # Create date object to validate year
         datetime(year, month, 1)
         return True
     except ValueError as e:
-        print(f"Invalid date: {str(e)}")
+        logger.error(f"Invalid date: {str(e)}")
         return False
 
 
-def calculate_unique_ranks(month=None, year=None, env='dev'):
-    """Calculate and update unique ranks for the specified month or current month"""
+def clone_monthly_data(source_month, source_year, target_month=None, target_year=None, env='dev'):
+    """Clone membership transaction data from source month to target month"""
     spark = None
     mongo_client = None
 
     try:
-        # If month/year not provided, use current
-        if month is None or year is None:
-            month, year = get_current_month_year()
+        # Validate source date
+        if not validate_date(source_month, source_year):
+            raise ValueError(f"Invalid source date: month={source_month}, year={source_year}")
 
-        # Validate the date
-        if not validate_month_year(month, year):
-            raise ValueError(f"Invalid month/year combination: {month}/{year}")
+        # If target month/year not provided, use next month
+        if target_month is None or target_year is None:
+            target_month, target_year = get_next_month_year(source_month, source_year)
 
-        print(f"Processing rankings for month: {month}, year: {year} in {env.upper()} environment")
+        # Validate target date
+        if not validate_date(target_month, target_year):
+            raise ValueError(f"Invalid target date: month={target_month}, year={target_year}")
+
+        logger.info(
+            f"Cloning data from {source_month}/{source_year} to {target_month}/{target_year} in {env} environment")
 
         # Initialize connections
         spark = create_spark_session(env)
-        mongo_client = get_mongodb_connection(env)
+        mongo_client, db_name = get_mongodb_connection(env)
+        db = mongo_client[db_name]
+
+        # Define collection names
+        source_collection = f"{source_year}_{source_month}"
+        target_collection = f"{target_year}_{target_month}"
+
+        # Get MongoDB configuration
         mongo_config = get_mongodb_config(env)
-        db = mongo_client[mongo_config['database']]
 
-        # Determine collection name
-        collection_name = f"{year}_{month}"
-        print(f"Using collection: {collection_name}")
+        # Log source collection details
+        logger.info(f"Reading from source collection: {source_collection}")
+        logger.info(f"Database: {db_name}")
 
-        # Read current month's data from MongoDB
-        df = spark.read \
+        # Read source month data with improved configuration
+        source_data = spark.read \
             .format("mongodb") \
-            .option("collection", collection_name) \
-            .option("readConcern.level", "majority") \
+            .option("database", db_name) \
+            .option("collection", source_collection) \
             .load()
 
-        count = df.count()
-        if count == 0:
-            print(f"No data found for month {month}, year {year}")
+        # Check if source data exists
+        source_count = source_data.count()
+        if source_count == 0:
+            logger.warning(f"No data found for source month {source_month}/{source_year}")
             return
 
-        print(f"Found {count} records to process")
+        logger.info(f"Found {source_count} records in source month")
 
-        # Create window spec for ranking
-        window_spec = Window.orderBy(
-            desc("totalpoints"),
-            asc("timestamp"),
-            asc("phone")
-        )
+        # Calculate timestamp for first day of target month
+        target_timestamp = int(
+            datetime(target_year, target_month, 1, tzinfo=pytz.timezone('Asia/Ho_Chi_Minh')).timestamp() * 1000)
 
-        # Calculate unique ranks
-        ranked_df = df.withColumn("new_rank", row_number().over(window_spec))
+        # Prepare data for target month
+        target_data = source_data \
+            .drop("_id") \
+            .withColumn("month", lit(target_month)) \
+            .withColumn("year", lit(target_year)) \
+            .withColumn("timestamp", lit(target_timestamp)) \
+            .withColumn("totalpoints", lit(0)) \
+            .withColumn("last_updated", current_timestamp())
 
-        # Prepare updates
-        updates = ranked_df.select(
-            col("_id"),
-            col("phone"),
-            col("membershipcode"),
-            col("membershipname"),
-            col("month"),
-            col("year"),
-            col("new_rank").alias("rank"),
-            col("totalpoints"),
-            col("timestamp")
-        ).collect()
+        # Convert to list of dictionaries for MongoDB operations
+        records = target_data.collect()
 
-        # Prepare bulk updates for MongoDB
-        collection = db[collection_name]
+        # Prepare bulk operations - use UpdateOne with upsert=True for all operations
         bulk_operations = []
+        for record in records:
+            doc = record.asDict()
+            phone = doc.get("phone")
 
-        for row in updates:
-            update_operation = UpdateOne(
-                {
-                    "phone": row["phone"]
-                },
-                {
-                    "$set": {
-                        "rank": row["rank"],
-                        "last_updated": datetime.now(pytz.timezone('Asia/Ho_Chi_Minh')),
-                        "phone": row["phone"],
-                        "month": row["month"],
-                        "year": row["year"],
-                        "timestamp": row["timestamp"]
-                    }
-                },
-                upsert=False
+            # Use UpdateOne with upsert=True for both new and existing records
+            bulk_operations.append(
+                UpdateOne(
+                    {"phone": phone, "month": target_month, "year": target_year},
+                    {"$set": doc},
+                    upsert=True
+                )
             )
-            bulk_operations.append(update_operation)
 
-        # Execute bulk update
+        # Execute bulk operations if any
         if bulk_operations:
-            result = collection.bulk_write(bulk_operations, ordered=False)
-            print(f"MongoDB Update Results - Modified: {result.modified_count}, "
-                  f"Upserted: {result.upserted_count}, Matched: {result.matched_count}")
+            collection = db[target_collection]
 
-        # Log ranking distribution
-        print("\nRanking Distribution:")
-        ranked_df.select(
-            "new_rank",
-            "totalpoints",
+            # Use batch processing to avoid overwhelming MongoDB
+            batch_size = 1000
+            total_upserted = 0
+            total_modified = 0
+            total_matched = 0
+
+            for i in range(0, len(bulk_operations), batch_size):
+                batch = bulk_operations[i:i + batch_size]
+                try:
+                    result = collection.bulk_write(batch, ordered=False)
+                    total_upserted += result.upserted_count
+                    total_modified += result.modified_count
+                    total_matched += result.matched_count
+                    logger.info(
+                        f"Processed batch {i // batch_size + 1}/{(len(bulk_operations) + batch_size - 1) // batch_size}: "
+                        f"Upserted: {result.upserted_count}, Modified: {result.modified_count}, "
+                        f"Matched: {result.matched_count}")
+                except Exception as e:
+                    logger.error(f"Error processing batch {i // batch_size + 1}: {str(e)}")
+                    # Continue with next batch instead of failing entire process
+
+            logger.info(f"\nBulk operation results:")
+            logger.info(f"  Upserted: {total_upserted}")
+            logger.info(f"  Modified: {total_modified}")
+            logger.info(f"  Matched: {total_matched}")
+            logger.info(f"  Total processed: {total_upserted + total_modified}")
+
+        # Create indexes on the collection
+        target_coll = db[target_collection]
+        target_coll.create_index([("phone", 1)], unique=True)
+        target_coll.create_index([("rank", 1)])
+        target_coll.create_index([("totalpoints", -1)])
+
+        logger.info(f"Successfully cloned data to {target_month}/{target_year}")
+
+        # Show sample of cloned data
+        logger.info("\nSample of cloned records:")
+        target_data.select(
             "phone",
+            "membershipcode",
+            "membershipname",
+            "month",
+            "year",
+            "rank",
+            "totalpoints",
             "timestamp"
-        ).orderBy("new_rank").show(10)
+        ).show(5, truncate=False)
 
-        # Verify no duplicate ranks
-        duplicate_ranks = ranked_df.groupBy("new_rank").count().filter(col("count") > 1)
-        if duplicate_ranks.count() > 0:
-            print("Warning: Duplicate ranks found!")
-            duplicate_ranks.show()
-        else:
-            print("Success: All ranks are unique!")
-
-        # Show points distribution
-        print("\nPoints Distribution Summary:")
-        ranked_df.summary("count", "min", "max", "mean").select(
-            "summary",
-            "totalpoints"
-        ).show()
+        return True
 
     except Exception as e:
-        print(f"Error calculating unique ranks: {str(e)}")
-        raise
+        logger.error(f"Error cloning monthly data: {str(e)}")
+        return False
     finally:
         if spark:
             spark.stop()
@@ -232,56 +282,46 @@ def calculate_unique_ranks(month=None, year=None, env='dev'):
             mongo_client.close()
 
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Process membership transaction monthly rankings')
-    parser.add_argument('--month', type=int, help='Month to process (1-12)')
-    parser.add_argument('--year', type=int, help='Year to process')
-    parser.add_argument('--env', type=str, choices=['dev', 'prod'], help='Environment (dev or prod)')
-
-    # Handle arguments for both direct running and spark-submit
-    if '--month' in sys.argv or '--year' in sys.argv or '--env' in sys.argv:
-        args = parser.parse_args()
-    else:
-        # Handle case when script is run with spark-submit where args come after script
-        start_idx = sys.argv.index(__file__) + 1 if __file__ in sys.argv else 1
-        args = parser.parse_args(sys.argv[start_idx:])
-
-    return args
-
-
 def main():
-    """Main entry point of the script"""
-    print(f"Starting MembershipTransactionMonthly Ranking Process at {datetime.now()}")
+    start_time = datetime.now()
+    logger.info(f"Starting Membership Monthly Clone Process at {start_time}")
 
-    # Determine environment
-    env = get_environment()
-    print(f"Running in {env.upper()} environment")
+    try:
+        # Parse arguments
+        args = parse_arguments()
 
-    # Parse command line arguments
-    args = parse_arguments()
+        # Validate that we have source month/year
+        if not args.source_month or not args.source_year:
+            logger.error("Source month and year are required")
+            sys.exit(1)
 
-    # Override environment if specified in args
-    if args.env:
-        env = args.env
-        print(f"Environment overridden to: {env.upper()}")
+        # Log environment
+        logger.info(f"Running in {args.env.upper()} environment")
 
-    # Get month and year from arguments or use current
-    month = args.month
-    year = args.year
+        # Clone data
+        success = clone_monthly_data(
+            args.source_month,
+            args.source_year,
+            args.target_month,
+            args.target_year,
+            args.env
+        )
 
-    if month is not None and year is not None:
-        print(f"Processing data for specified month: {month}/{year}")
-    else:
-        curr_month, curr_year = get_current_month_year()
-        month = month or curr_month
-        year = year or curr_year
-        print(f"Using month: {month}/{year} (current: {curr_month}/{curr_year})")
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
 
-    # Run the ranking calculation with environment
-    calculate_unique_ranks(month, year, env)
+        if success:
+            logger.info(f"Clone Process Completed Successfully at {end_time}")
+            logger.info(f"Total duration: {duration:.2f} seconds")
+            sys.exit(0)
+        else:
+            logger.error(f"Clone Process Failed at {end_time}")
+            logger.info(f"Total duration: {duration:.2f} seconds")
+            sys.exit(1)
 
-    print(f"MembershipTransactionMonthly Ranking Process Completed at {datetime.now()}")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {str(e)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -65,10 +65,11 @@ def get_mongodb_config(env):
             'database': 'activity_membershiptransactionmonthly_dev'
         }
     else:  # prod
+        # Fixed the connection string format for production environment
+        # Using proper format with authSource parameter in the URI itself
         return {
-            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017',
-            'database': 'activity_membershiptransactionmonthly',
-            'auth_source': 'admin'
+            'host': 'mongodb://admin:gctStAiH22368l5qziUV@192.168.11.171:27017,192.168.11.172:27017,192.168.11.173:27017/?authSource=admin',
+            'database': 'activity_membershiptransactionmonthly'
         }
 
 
@@ -76,20 +77,24 @@ def create_spark_session(env):
     """Create Spark session with MongoDB configurations"""
     mongo_config = get_mongodb_config(env)
 
+    # Use the proper MongoDB connection URI format
+    mongo_uri = mongo_config['host']
+    database = mongo_config['database']
+
+    # Build SparkSession with proper MongoDB connector configuration
     builder = SparkSession.builder \
         .appName(f"membership-monthly-cloner-{env}") \
-        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1") \
-        .config("spark.mongodb.read.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.write.connection.uri", f"{mongo_config['host']}/{mongo_config['database']}") \
-        .config("spark.mongodb.read.database", mongo_config['database']) \
-        .config("spark.mongodb.write.database", mongo_config['database'])
+        .config("spark.jars.packages", "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1")
 
-    # Add authentication for production
-    if env == 'prod' and 'auth_source' in mongo_config:
-        builder = builder \
-            .config("spark.mongodb.auth.source", mongo_config['auth_source'])
+    # Configure MongoDB connection with connection.uri which is the correct property
+    builder = builder.config("spark.mongodb.connection.uri", mongo_uri)
 
-    return builder.getOrCreate()
+    # Create and return the SparkSession
+    spark = builder.getOrCreate()
+    logger.info(f"Created SparkSession with app ID: {spark.sparkContext.applicationId}")
+    logger.info(f"Connected to MongoDB: {mongo_uri.split('@')[-1]} database: {database}")
+
+    return spark
 
 
 def get_mongodb_connection(env):
@@ -97,14 +102,8 @@ def get_mongodb_connection(env):
     try:
         mongo_config = get_mongodb_config(env)
 
-        # Create client with appropriate authentication
-        if env == 'dev':
-            client = MongoClient(mongo_config['host'])
-        else:  # prod
-            client = MongoClient(
-                mongo_config['host'],
-                authSource=mongo_config['auth_source']
-            )
+        # Use the URI directly which includes authentication if needed
+        client = MongoClient(mongo_config['host'])
 
         # Test connection
         client.admin.command('ping')
@@ -166,11 +165,18 @@ def clone_monthly_data(source_month, source_year, target_month=None, target_year
         source_collection = f"{source_year}_{source_month}"
         target_collection = f"{target_year}_{target_month}"
 
-        # Read source month data
+        # Get MongoDB configuration
+        mongo_config = get_mongodb_config(env)
+
+        # Log source collection details
+        logger.info(f"Reading from source collection: {source_collection}")
+        logger.info(f"Database: {db_name}")
+
+        # Read source month data with improved configuration
         source_data = spark.read \
             .format("mongodb") \
+            .option("database", db_name) \
             .option("collection", source_collection) \
-            .option("readConcern.level", "majority") \
             .load()
 
         # Check if source data exists
@@ -288,6 +294,9 @@ def main():
         if not args.source_month or not args.source_year:
             logger.error("Source month and year are required")
             sys.exit(1)
+
+        # Log environment
+        logger.info(f"Running in {args.env.upper()} environment")
 
         # Clone data
         success = clone_monthly_data(
